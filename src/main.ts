@@ -1,12 +1,17 @@
 import { audio, type MusicMode } from './audio';
 import { BOSS_WAVES } from './data';
 import { Game } from './game';
-import { H, W, project } from './layout';
+import { FIELD_TOP, FIELD_X, H, W } from './layout';
 import { armorySlot, isOverPanel, placementSpot, render, type Button } from './render';
-import { ARMORY_SIZE } from './upgrades';
+import { Scene3D } from './scene3d';
+import { ARMORY_SIZE, BOOST_IDS } from './upgrades';
+import { FIELD_H, FIELD_W, project, rotateView, zoomView } from './view';
 
+const stage = document.getElementById('stage') as HTMLDivElement;
 const canvas = document.getElementById('game') as HTMLCanvasElement;
 const ctx = canvas.getContext('2d')!;
+const worldCanvas = document.getElementById('world') as HTMLCanvasElement;
+const world = new Scene3D(worldCanvas);
 
 function newGame(): Game {
   const g = new Game();
@@ -19,13 +24,23 @@ let buttons: Button[] = [];
 const audioUi = { open: false };
 const mouse = { x: -1, y: -1 };
 
+let viewScale = 1;
+
 function resize(): void {
-  const scale = Math.min(window.innerWidth / W, window.innerHeight / H);
+  viewScale = Math.min(window.innerWidth / W, window.innerHeight / H);
   const dpr = window.devicePixelRatio || 1;
-  canvas.style.width = `${Math.floor(W * scale)}px`;
-  canvas.style.height = `${Math.floor(H * scale)}px`;
-  canvas.width = Math.floor(W * scale * dpr);
-  canvas.height = Math.floor(H * scale * dpr);
+  stage.style.width = `${Math.floor(W * viewScale)}px`;
+  stage.style.height = `${Math.floor(H * viewScale)}px`;
+  canvas.style.width = stage.style.width;
+  canvas.style.height = stage.style.height;
+  canvas.width = Math.floor(W * viewScale * dpr);
+  canvas.height = Math.floor(H * viewScale * dpr);
+  // The 3D canvas covers only the battlefield, to the right of the panel and below the top bar.
+  worldCanvas.style.left = `${FIELD_X * viewScale}px`;
+  worldCanvas.style.top = `${FIELD_TOP * viewScale}px`;
+  worldCanvas.style.width = `${FIELD_W * viewScale}px`;
+  worldCanvas.style.height = `${FIELD_H * viewScale}px`;
+  world.resize(Math.floor(FIELD_W * viewScale), Math.floor(FIELD_H * viewScale), dpr);
 }
 window.addEventListener('resize', resize);
 resize();
@@ -73,9 +88,42 @@ const restart = () => {
   game = newGame();
 };
 
+/** Keeps receiving pointer events while dragging outside the canvas (best effort). */
+function capture(e: PointerEvent): void {
+  try {
+    canvas.setPointerCapture(e.pointerId);
+  } catch {
+    // Pointer already released: dragging still works while it stays over the canvas.
+  }
+}
+
+const orbit = { active: false, lastX: 0 };
+const overField = (p: { x: number; y: number }) => p.x >= FIELD_X && p.y >= FIELD_TOP;
+
+canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+canvas.addEventListener(
+  'wheel',
+  (e) => {
+    if (!overField(toGame(e as unknown as PointerEvent))) return;
+    e.preventDefault();
+    zoomView(e.deltaY > 0 ? 0.92 : 1.08);
+  },
+  { passive: false },
+);
+
 canvas.addEventListener('pointerdown', (e) => {
   audio.unlock();
   const p = toGame(e);
+  // Right mouse button rotates the camera.
+  if (e.button === 2) {
+    if (overField(p)) {
+      orbit.active = true;
+      orbit.lastX = e.clientX;
+      capture(e);
+    }
+    return;
+  }
   Object.assign(mouse, p);
   const b = buttonAt(p);
   if (b) {
@@ -93,18 +141,24 @@ canvas.addEventListener('pointerdown', (e) => {
   if (slot !== null && game.armory[slot] && game.phase === 'build') {
     game.dragItem = { index: slot };
     audio.play('pickup');
-    canvas.setPointerCapture(e.pointerId);
+    capture(e);
     return;
   }
   const i = unitAt(p);
+  if (i === null) game.selected = null;
   if (i !== null && game.canDrag(i)) {
     game.drag = { from: i, x: p.x, y: p.y };
     audio.play('pickup');
-    canvas.setPointerCapture(e.pointerId);
+    capture(e);
   }
 });
 
 canvas.addEventListener('pointermove', (e) => {
+  if (orbit.active) {
+    rotateView(-(e.clientX - orbit.lastX) * 0.006);
+    orbit.lastX = e.clientX;
+    return;
+  }
   Object.assign(mouse, toGame(e));
   game.hover = overlayOpen() ? null : unitAt(mouse);
   if (game.drag || game.dragItem) {
@@ -117,6 +171,10 @@ canvas.addEventListener('pointermove', (e) => {
 });
 
 canvas.addEventListener('pointerup', (e) => {
+  if (orbit.active) {
+    orbit.active = false;
+    return;
+  }
   if (game.dragItem) {
     const item = game.dragItem;
     game.dragItem = null;
@@ -134,6 +192,12 @@ canvas.addEventListener('pointerup', (e) => {
     game.salvage(drag.from);
     return;
   }
+  // Released without really moving: that's a click, which selects (or deselects) the unit.
+  if (Math.hypot(p.x - drag.x, p.y - drag.y) < 6) {
+    game.selected = game.selected === drag.from ? null : drag.from;
+    return;
+  }
+  game.selected = null;
   const to = unitAt(p);
   if (to !== null && to !== drag.from) game.drop(drag.from, to);
   else game.moveUnit(drag.from, placementSpot(p));
@@ -154,13 +218,15 @@ window.addEventListener('keydown', (e) => {
   } else if (e.code === 'Enter') game.launch();
   else if (e.code === 'KeyS' && game.phase === 'combat') game.toggleSpeed();
   else if (e.code === 'KeyR' && (game.phase === 'over' || game.phase === 'victory')) restart();
-  else if (['Digit1', 'Digit2', 'Digit3'].includes(e.code)) {
+  else if (['Digit1', 'Digit2', 'Digit3', 'Digit4'].includes(e.code)) {
     const n = Number(e.code.slice(-1)) - 1;
     if (game.upgradeChoice()) game.chooseVariant(n);
-    else game.pickReward(n);
+    else if (game.phase === 'reward') game.pickReward(n);
+    else if (game.selected !== null) game.boost(game.selected, BOOST_IDS[n]);
   } else if (e.code === 'Escape') {
     game.drag = null;
     game.dragItem = null;
+    game.selected = null;
     audioUi.open = false;
   }
 });
@@ -177,6 +243,17 @@ function frame(now: number): void {
   last = now;
   game.update(dt);
   audio.setMusic(musicFor(game));
+
+  // 3D battlefield: the dragged unit is previewed where it would land.
+  let ghost: { from: number; at: { x: number; y: number } | null } | null = null;
+  if (game.drag) {
+    const overUnit = game.hover !== null && game.hover !== game.drag.from;
+    ghost = { from: game.drag.from, at: overUnit || isOverPanel(mouse) ? null : placementSpot(mouse) };
+  }
+  world.sync(game, dt * (game.phase === 'combat' ? game.speed : 1), ghost);
+  world.render();
+  const shake = game.shake > 0 ? game.shake * viewScale : 0;
+  worldCanvas.style.transform = shake ? `translate(${(Math.random() - 0.5) * shake}px, ${(Math.random() - 0.5) * shake}px)` : '';
   if (game.drag && !game.canDrag(game.drag.from)) game.drag = null;
 
   const scale = canvas.width / W;
@@ -190,3 +267,6 @@ requestAnimationFrame(frame);
 
 // Exposed for debugging in the browser console.
 (window as unknown as { game: () => Game }).game = () => game;
+if (import.meta.env.DEV) {
+  void import('./sim').then((m) => Object.assign(window, { sim: m.simulate, difficulty: m.DIFFICULTY }));
+}

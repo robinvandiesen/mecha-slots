@@ -90,3 +90,45 @@ export function equipById(id: EquipId): EquipDef {
 }
 
 export const ARMORY_SIZE = 6;
+
+// ---------- Scrap upgrades ----------
+// Bought per mech with scrap, separate from levels (which only come from merging).
+
+export type BoostId = 'firepower' | 'armour' | 'reactor' | 'mobility';
+
+export const BOOST_IDS: BoostId[] = ['firepower', 'armour', 'reactor', 'mobility'];
+export const BOOST_MAX = 5;
+
+export interface BoostDef {
+  id: BoostId;
+  name: string;
+  color: string;
+  /** Effect of one rank. */
+  perRank: StatMods;
+  desc: string;
+}
+
+export function boostDef(id: BoostId, type: MechType): BoostDef {
+  switch (id) {
+    case 'firepower':
+      return { id, name: 'Firepower', color: '#ff5ad8', perRank: { dmg: 0.12 }, desc: '+12% damage' };
+    case 'armour':
+      return { id, name: 'Armour', color: '#e8edf4', perRank: { hp: 0.15 }, desc: '+15% max HP' };
+    case 'reactor':
+      return { id, name: 'Reactor', color: '#7df4ff', perRank: { rate: 0.1 }, desc: '+10% attack speed' };
+    case 'mobility':
+      // Artillery never moves, so it gets a bigger blast instead.
+      return type === 'artillery'
+        ? { id, name: 'Blast Radius', color: '#ffb347', perRank: { splash: 0.12 }, desc: '+12% blast radius' }
+        : { id, name: 'Thrusters', color: '#5fe3ff', perRank: { speed: 0.12 }, desc: '+12% move speed' };
+  }
+}
+
+/** Scrap for the next rank of an upgrade: 16, 28, 40, 52, 64. */
+export function boostCost(rank: number): number {
+  return 16 + 12 * rank;
+}
+
+export function emptyBoosts(): Record<BoostId, number> {
+  return { firepower: 0, armour: 0, reactor: 0, mobility: 0 };
+}

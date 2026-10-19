@@ -1,11 +1,11 @@
-import type { EnemyType, MechType, SymbolId } from './data';
+import type { MechType, SymbolId } from './data';
 import type { EquipId } from './upgrades';
 
 // Sprites are pixel art painted once into small offscreen canvases (1 unit = 1 pixel),
 // given a dark outline, cached, and scaled up with nearest-neighbour when drawn.
 // Coordinates are relative to the unit's feet (centre-bottom); x grows forward
-// (right), y grows downward, so body parts use negative y. Enemies are painted
-// facing right like the player's mechs and mirrored when drawn.
+// (right), y grows downward, so body parts use negative y. These pixel-art mechs
+// are used for UI icons (reel symbols, previews); the battlefield is 3D (models.ts).
 
 type Px = (x: number, y: number, w: number, h: number, c: string) => void;
 
@@ -44,9 +44,6 @@ const MECH_PAL: Record<MechType, Pal> = {
   bulwark: { white: WHITE, whiteS: WHITE_S, main: '#3aa65a', mainS: '#246a3a', acc: '#dc3540', accS: '#8f1f27', trim: '#ffd23f', eye: '#7df4ff', frame: FRAME, frameS: FRAME_S },
 };
 
-const GRUNT_PAL: Pal = { white: '#6f9a55', whiteS: '#46663a', main: '#3c5a32', mainS: '#26391f', acc: '#58663f', accS: '#353e26', trim: '#d8bf5a', eye: '#ff3b7f', frame: '#3a3f4a', frameS: '#23262e' };
-const HEAVY_PAL: Pal = { white: '#7a56b0', whiteS: '#4e3778', main: '#33264f', mainS: '#1e1632', acc: '#4a4560', accS: '#2c2a3a', trim: '#e0c860', eye: '#ff3b7f', frame: '#3a3f4a', frameS: '#23262e' };
-const TITAN_PAL: Pal = { white: '#c0485e', whiteS: '#86283c', main: '#7a2236', mainS: '#4a1322', acc: '#5a2a36', accS: '#341820', trim: '#ff9d2f', eye: '#ffef5c', frame: '#3a3f4a', frameS: '#23262e' };
 
 const cache = new Map<string, Sprite>();
 
@@ -245,16 +242,6 @@ const MECH_W = 60;
 const MECH_H = 56;
 const MECH_AX = 24;
 const MECH_AY = 53;
-
-/** Weapon muzzle in sprite units, used by the game for projectile origins. */
-export const MUZZLE: Record<MechType, { x: number; y: number }> = {
-  gunner: { x: 21, y: -23 },
-  lancer: { x: 20, y: -23 },
-  artillery: { x: -1, y: -46 },
-  bulwark: { x: 22, y: -25 },
-};
-
-export const MECH_HEIGHT = 46;
 
 export function mechScale(tier: number, base = 1.45): number {
   return base * (1 + 0.1 * (tier - 1));
@@ -514,280 +501,6 @@ export function drawMech(ctx: CanvasRenderingContext2D, type: MechType, x: numbe
     ctx.restore();
   }
   blit(ctx, sprite, x, y + bob, s, o.flip);
-}
-
-// ---------- Enemies ----------
-
-const SNIPER_PAL: Pal = { white: '#5f7896', whiteS: '#3c4e66', main: '#2c3a50', mainS: '#1a2433', acc: '#465264', accS: '#2a313d', trim: '#d8bf5a', eye: '#ff3b7f', frame: '#3a3f4a', frameS: '#23262e' };
-const SHIELD_PAL: Pal = { white: '#b59a62', whiteS: '#7d6a40', main: '#5c4c2c', mainS: '#3a301b', acc: '#6a5a3a', accS: '#433924', trim: '#e0c860', eye: '#ff3b7f', frame: '#3a3f4a', frameS: '#23262e' };
-const BOMB = { main: '#b8323f', light: '#e85a66', dark: '#5a1520' };
-
-export const ENEMY_SCALE: Record<EnemyType, number> = { drone: 1.8, crawler: 1.3, brute: 1.6, titan: 1.9, bomber: 1.7, jet: 1.8, sniper: 1.3, shield: 1.5, medic: 1.6 };
-
-type Soldier = 'grunt' | 'sniper' | 'shield';
-
-/** Mono-eye infantry suits that share a body: grunt (machine gun), sniper (long rifle) and shield trooper. */
-function soldierSprite(kind: Soldier, step: number, atk: boolean, eye: number): Sprite {
-  const pal = kind === 'sniper' ? SNIPER_PAL : kind === 'shield' ? SHIELD_PAL : GRUNT_PAL;
-  return cached(`e:${kind}:${step}:${atk}:${eye}`, () =>
-    build(MECH_W, MECH_H, MECH_AX, MECH_AY, (p) => {
-      p(-12, -32, 5, 9, pal.white);
-      p(-14, -28, 3, 4, pal.frame);
-      if (kind === 'sniper') {
-        p(-11, -44, 1, 10, pal.whiteS);
-        p(-12, -44, 3, 1, pal.trim);
-      }
-      const bulky = kind === 'shield';
-      leg(p, pal, -4 + (step ? 1 : -1), true, step ? 0 : 2, bulky);
-      leg(p, pal, 1 + (step ? -1 : 1), false, step ? 2 : 0, bulky);
-      hips(p, pal);
-      torso(p, pal, bulky);
-      head(p, pal, 'mono', eye);
-      if (kind === 'sniper') p(1, -41, 5, 2, pal.frameS);
-      p(-11, -36, 7, 9, pal.white);
-      p(-11, -36, 7, 1, pal.whiteS);
-      shoulder(p, pal, 1, kind === 'shield');
-      arm(p, pal, atk ? 1 : 0);
-      const k = atk ? -1 : 0;
-      if (kind === 'grunt') {
-        p(3 + k, -25, 13, 3, pal.frame);
-        p(6 + k, -22, 4, 4, pal.frameS);
-        p(16 + k, -24, 4, 1, pal.frame);
-      } else if (kind === 'sniper') {
-        p(2 + k, -25, 26, 2, pal.frame);
-        p(6 + k, -28, 7, 3, pal.frameS);
-        p(12 + k, -27, 1, 1, pal.eye);
-        p(26 + k, -26, 2, 4, pal.frameS);
-      } else {
-        p(3, -22, 8, 2, pal.frame);
-        p(9 + (atk ? 3 : 0), -41, 7, 37, '#6a7385');
-        p(9 + (atk ? 3 : 0), -41, 2, 37, '#4a5262');
-        p(15 + (atk ? 3 : 0), -41, 1, 37, '#9aa4b5');
-        p(11 + (atk ? 3 : 0), -30, 3, 6, pal.trim);
-      }
-    }),
-  );
-}
-
-function heavySprite(step: number, atk: boolean, eye: number): Sprite {
-  const pal = HEAVY_PAL;
-  return cached(`e:heavy:${step}:${atk}:${eye}`, () =>
-    build(MECH_W, MECH_H, MECH_AX, MECH_AY, (p) => {
-      p(-13, -33, 6, 11, pal.white);
-      leg(p, pal, -5 + (step ? 1 : -1), true, step ? 0 : 1, true);
-      leg(p, pal, 1 + (step ? -1 : 1), false, step ? 1 : 0, true);
-      p(-9, -22, 18, 6, pal.white);
-      p(-9, -17, 18, 1, pal.whiteS);
-      torso(p, pal, true);
-      head(p, pal, 'mono', eye);
-      shoulder(p, pal, 1, true);
-      arm(p, pal, atk ? 2 : 0);
-      if (!atk) p(6, -36, 2, 12, pal.frame);
-      else p(8, -26, 4, 2, pal.frame);
-    }, (p) => {
-      if (!atk) {
-        p(4, -46, 6, 11, '#ff7a2f');
-        p(6, -45, 2, 9, '#ffd8a0');
-      } else {
-        p(12, -27, 16, 4, '#ff7a2f');
-        p(12, -26, 15, 2, '#ffd8a0');
-      }
-    }),
-  );
-}
-
-function droneSprite(flap: boolean): Sprite {
-  const pal = GRUNT_PAL;
-  return cached(`e:drone:${flap}`, () =>
-    build(30, 22, 14, 19, (p) => {
-      p(-8, -8, 3, 4, pal.frame);
-      p(-6, -10, 12, 9, pal.white);
-      p(-6, -10, 12, 1, '#9fc483');
-      p(-6, -3, 12, 2, pal.whiteS);
-      p(-3, -13, 7, 3, pal.main);
-      p(2, -7, 5, 3, pal.frameS);
-      p(3, -7, 3, 2, pal.eye);
-      p(-5, flap ? -1 : 0, 3, 2, pal.frame);
-      p(2, flap ? 0 : -1, 3, 2, pal.frame);
-      p(-1, -15, 1, 2, pal.trim);
-    }),
-  );
-}
-
-function bomberSprite(blink: boolean): Sprite {
-  return cached(`e:bomber:${blink}`, () =>
-    build(30, 24, 14, 21, (p) => {
-      p(-6, -12, 12, 10, BOMB.main);
-      p(-5, -13, 10, 1, BOMB.light);
-      p(-7, -10, 1, 6, BOMB.main);
-      p(6, -10, 1, 6, BOMB.main);
-      p(-6, -3, 12, 2, BOMB.dark);
-      for (const [x, y] of [[-8, -8], [7, -8], [-1, -15], [-4, -1], [3, -1]]) p(x, y, 2, 2, '#3a3f4a');
-      p(2, -9, 3, 3, '#23262e');
-      p(-2, -16, 3, 2, '#3a3f4a');
-    }, (p) => {
-      p(3, -8, 2, 2, '#ff3b7f');
-      if (blink) p(-1, -17, 1, 1, '#ffef5c');
-    }),
-  );
-}
-
-function jetSprite(flame: boolean): Sprite {
-  const pal = GRUNT_PAL;
-  return cached(`e:jet:${flame}`, () =>
-    build(40, 20, 20, 16, (p) => {
-      p(-14, -12, 4, 6, pal.main);
-      p(-12, -7, 22, 4, pal.white);
-      p(-12, -7, 22, 1, '#9fc483');
-      p(-12, -4, 22, 1, pal.whiteS);
-      p(10, -6, 4, 2, pal.white);
-      p(14, -5, 2, 1, pal.whiteS);
-      p(1, -9, 6, 2, pal.frameS);
-      p(3, -9, 3, 1, pal.eye);
-      p(-6, -3, 10, 2, pal.main);
-      p(-4, -1, 6, 1, pal.mainS);
-      p(-15, -6, 3, 2, pal.frame);
-    }, (p) => {
-      p(flame ? -19 : -18, -6, flame ? 4 : 3, 2, '#ffb347');
-      p(-17, -6, 2, 1, '#fff3c0');
-    }),
-  );
-}
-
-function medicSprite(step: number, eye: number): Sprite {
-  const pal = { body: '#d8d2b8', shade: '#9c967e', frame: '#3a3f4a', frameS: '#23262e' };
-  return cached(`e:medic:${step}:${eye}`, () =>
-    build(36, 30, 17, 27, (p) => {
-      p(4, -24, 2, 10, pal.frame);
-      p(4, -24, 9, 2, pal.frame);
-      p(12, -24, 2, 5, pal.frameS);
-      p(-12, -6, 24, 6, pal.frameS);
-      p(-12, -6, 24, 1, pal.frame);
-      for (let k = 0; k < 5; k++) p(-10 + k * 5 + step, -4, 2, 2, '#6a7385');
-      p(-10, -15, 20, 9, pal.body);
-      p(-10, -15, 20, 1, '#f0ecdc');
-      p(-10, -7, 20, 1, pal.shade);
-      p(-6, -19, 10, 4, pal.body);
-      p(5, -12, 4, 3, pal.frameS);
-      p(5 + eye, -12, 2, 2, '#ff3b7f');
-    }, (p) => {
-      p(-4, -14, 2, 6, '#6dffb8');
-      p(-6, -12, 6, 2, '#6dffb8');
-    }),
-  );
-}
-
-function titanSprite(step: number, atk: boolean, eye: number): Sprite {
-  const pal = TITAN_PAL;
-  return cached(`e:titan:${step}:${atk}:${eye}`, () =>
-    build(76, 56, 36, 53, (p) => {
-      for (let k = 0; k < 4; k++) {
-        const lx = -22 + k * 13;
-        const lift = (k + step) % 2 ? 2 : 0;
-        p(lx, -18, 4, 10 - lift, pal.frame);
-        p(lx - 2, -8 - lift, 8, 4, pal.frameS);
-        p(lx - 3, -4 - lift, 10, 2, pal.acc);
-      }
-      p(-26, -36, 50, 18, pal.main);
-      p(-22, -42, 42, 6, pal.main);
-      p(-14, -46, 26, 4, pal.white);
-      p(-14, -46, 26, 1, '#e87a8a');
-      p(-26, -20, 50, 3, pal.mainS);
-      p(-26, -36, 4, 18, pal.mainS);
-      for (let k = 0; k < 4; k++) p(-16 + k * 7, -40, 4, 2, pal.trim);
-      p(8, -34, 16, 6, pal.frameS);
-      p(14 + eye * 2, -33, 4, 4, pal.eye);
-      p(-20, -30, 16, 2, pal.white);
-      p(-20, -26, 16, 2, pal.whiteS);
-      const claw = atk ? 4 : 0;
-      p(22, -24, 8 + claw, 4, pal.frame);
-      p(28 + claw, -28, 4, 4, pal.trim);
-      p(28 + claw, -20, 4, 4, pal.trim);
-      p(-30, -40, 6, 4, pal.frame);
-      p(-34, -44, 6, 6, pal.frameS);
-    }, (p) => {
-      if (atk) {
-        p(32, -26, 6, 4, '#ffef5c');
-        p(34, -25, 3, 2, '#ffffff');
-      }
-    }),
-  );
-}
-
-export interface EnemyDrawOpts {
-  t: number;
-  flash: number;
-  attack: number;
-  /** Face right instead of left. */
-  flip?: boolean;
-}
-
-export function drawEnemy(ctx: CanvasRenderingContext2D, type: EnemyType, x: number, y: number, o: EnemyDrawOpts): void {
-  const s = ENEMY_SCALE[type];
-  const atk = o.attack > 0.4;
-  const step = Math.floor(o.t * 4 + x * 0.05) % 2;
-  const eye = Math.round(Math.sin(o.t * 1.5 + x * 0.1) + 1) as 0 | 1 | 2;
-
-  let sprite: Sprite;
-  let hover = 0;
-  switch (type) {
-    case 'drone':
-      sprite = droneSprite(Math.sin(o.t * 30 + x) > 0);
-      hover = Math.round(Math.sin(o.t * 5 + x * 0.1) * 2 - 12);
-      shadow(ctx, x, y, 8 * s, 1.5 * s);
-      break;
-    case 'bomber':
-      sprite = bomberSprite(Math.sin(o.t * 12 + x) > 0);
-      hover = Math.round(Math.sin(o.t * 7 + x * 0.1) * 1.5 - 6);
-      shadow(ctx, x, y, 7 * s, 1.5 * s);
-      break;
-    case 'jet':
-      sprite = jetSprite(Math.sin(o.t * 40 + x) > 0);
-      hover = Math.round(Math.sin(o.t * 3 + x * 0.05) * 2 - 28);
-      shadow(ctx, x, y, 12 * s, 1.5 * s);
-      break;
-    case 'crawler':
-      sprite = soldierSprite('grunt', step, atk, eye);
-      shadow(ctx, x, y, 12 * s, 2 * s);
-      break;
-    case 'sniper':
-      sprite = soldierSprite('sniper', step, atk, eye);
-      shadow(ctx, x, y, 12 * s, 2 * s);
-      break;
-    case 'shield':
-      sprite = soldierSprite('shield', step, atk, eye);
-      shadow(ctx, x, y, 14 * s, 2.5 * s);
-      break;
-    case 'medic':
-      sprite = medicSprite(step, eye);
-      shadow(ctx, x, y, 12 * s, 2 * s);
-      break;
-    case 'brute':
-      sprite = heavySprite(step, atk, eye);
-      shadow(ctx, x, y, 14 * s, 2.5 * s);
-      break;
-    case 'titan':
-      sprite = titanSprite(step, atk, eye);
-      shadow(ctx, x, y, 28 * s, 3 * s);
-      break;
-  }
-  if (o.flash > 0) sprite = whiteOfCached(sprite);
-  blit(ctx, sprite, x, y + hover * s, s, !o.flip);
-}
-
-const whiteCache = new WeakMap<Sprite, Sprite>();
-
-function whiteOfCached(s: Sprite): Sprite {
-  let w = whiteCache.get(s);
-  if (!w) {
-    w = whiteOf(s);
-    whiteCache.set(s, w);
-  }
-  return w;
-}
-
-export function enemyHeight(type: EnemyType): number {
-  return { drone: 54, crawler: 60, brute: 78, titan: 92, bomber: 44, jet: 84, sniper: 60, shield: 68, medic: 40 }[type];
 }
 
 // ---------- Equipment icons ----------

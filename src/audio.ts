@@ -7,6 +7,8 @@ export type Sfx =
   | 'spinStart'
   | 'reelStop'
   | 'win'
+  | 'jackpot'
+  | 'tension'
   | 'noMatch'
   | 'launch'
   | 'land'
@@ -104,6 +106,8 @@ export class AudioEngine {
   private lastPlayed = new Map<Sfx, number>();
   private voices = 0;
   private pitch = 1;
+  /** Stereo position of the sound being played: -1 (left) to 1 (right). */
+  private pan = 0;
 
   private mode: MusicMode = 'none';
   private pendingMode: MusicMode = 'none';
@@ -209,7 +213,7 @@ export class AudioEngine {
       node.connect(f);
       node = f;
     }
-    node.connect(g).connect(o.dest ?? this.sfxBus);
+    node.connect(g).connect(this.out(o.dest));
     osc.start(t);
     osc.stop(t + dur + 0.05);
     this.track(osc);
@@ -228,10 +232,19 @@ export class AudioEngine {
     f.Q.value = o.filter?.q ?? 0.8;
     const g = ctx.createGain();
     this.envelope(g, t, peak, o.attack ?? 0.002, dur);
-    src.connect(f).connect(g).connect(o.dest ?? this.sfxBus);
+    src.connect(f).connect(g).connect(this.out(o.dest));
     src.start(t, Math.random() * 0.5);
     src.stop(t + dur + 0.05);
     this.track(src);
+  }
+
+  /** Destination for a voice: music goes straight to its bus; effects are panned to where they happen. */
+  private out(dest?: AudioNode): AudioNode {
+    if (dest || !this.pan) return dest ?? this.sfxBus;
+    const panner = this.ctx!.createStereoPanner();
+    panner.pan.value = this.pan;
+    panner.connect(this.sfxBus);
+    return panner;
   }
 
   private envelope(g: GainNode, t: number, peak: number, attack: number, dur: number): void {
@@ -251,7 +264,7 @@ export class AudioEngine {
 
   // ---------- Sound effects ----------
 
-  play(name: Sfx, opts: { count?: number } = {}): void {
+  play(name: Sfx, opts: { count?: number; pan?: number } = {}): void {
     const ctx = this.ctx;
     if (!ctx || ctx.state !== 'running' || this.settings.sfxMuted || this.settings.sfx === 0) return;
     const now = ctx.currentTime;
@@ -261,28 +274,60 @@ export class AudioEngine {
     if (!essential && this.voices > MAX_VOICES) return;
     this.lastPlayed.set(name, now);
     this.pitch = 0.95 + Math.random() * 0.1;
+    this.pan = Math.max(-1, Math.min(1, opts.pan ?? 0));
+    /** Random helpers for per-play variation. */
+    const rnd = (a: number, b: number) => a + Math.random() * (b - a);
+    const pick = <T>(items: T[]): T => items[Math.floor(Math.random() * items.length)];
 
     switch (name) {
       case 'click':
         this.pitch = 1;
         this.tone('square', 1300, 900, 0.03, 0.08);
         break;
-      case 'tick':
-        this.tone('square', 2400, 2000, 0.012, 0.03);
+      case 'tick': {
+        const f = rnd(1900, 2900);
+        this.tone(pick(['square', 'triangle'] as OscillatorType[]), f, f * rnd(0.75, 0.9), rnd(0.01, 0.018), rnd(0.02, 0.035));
         break;
-      case 'spinStart':
-        this.tone('sawtooth', 160, 520, 0.22, 0.08, { filter: { type: 'lowpass', freq: 600, to: 2400 } });
-        this.noise(0.2, 0.12, 'bandpass', 600, 2600);
+      }
+      case 'spinStart': {
+        const f = rnd(140, 200);
+        this.tone('sawtooth', f, f * rnd(2.8, 3.8), rnd(0.18, 0.28), 0.08, { filter: { type: 'lowpass', freq: 600, to: rnd(2000, 3200) } });
+        this.noise(rnd(0.16, 0.26), 0.12, 'bandpass', rnd(500, 800), rnd(2200, 3200));
         break;
-      case 'reelStop':
-        this.tone('sine', 190, 60, 0.09, 0.45);
-        this.noise(0.03, 0.15, 'lowpass', 2500, 1200);
+      }
+      case 'reelStop': {
+        // Each reel lands with its own thud (count = how many reels have stopped before it).
+        const f = [200, 175, 150][Math.min(2, opts.count ?? 0)] * rnd(0.92, 1.08);
+        this.tone('sine', f, f * 0.32, rnd(0.08, 0.12), 0.45);
+        this.tone('square', f * 4, f * 3, 0.02, 0.04);
+        this.noise(0.03, 0.15, 'lowpass', rnd(2000, 3200), 1200);
         break;
+      }
       case 'win': {
+        // A different key and melody shape every time.
         this.pitch = 1;
         const big = (opts.count ?? 1) > 1;
-        this.notes(big ? [0, 4, 7, 12, 16, 19] : [0, 4, 7, 12], 659, 0.07, 0.22, 0.16);
-        this.noise(0.4, 0.05, 'highpass', 6000, 9000, { when: 0.1 });
+        const shapes = big
+          ? [[0, 4, 7, 12, 16, 19], [0, 5, 9, 12, 17, 21], [0, 4, 7, 11, 14, 19], [0, 7, 12, 16, 19, 24]]
+          : [[0, 4, 7, 12], [0, 5, 9, 12], [0, 7, 12, 16], [0, 4, 9, 12], [0, 2, 7, 12]];
+        const key = pick([587, 622, 659, 698, 740]);
+        this.notes(pick(shapes), key, rnd(0.06, 0.08), 0.22, 0.16, pick(['triangle', 'square'] as OscillatorType[]));
+        this.noise(0.4, 0.05, 'highpass', 6000, rnd(8000, 11000), { when: 0.1 });
+        break;
+      }
+      case 'jackpot':
+        this.pitch = pick([0.94, 1, 1.06]);
+        this.notes(pick([[0, 4, 7, 12, 16, 19, 24, 28], [0, 5, 9, 12, 17, 21, 24, 29], [0, 7, 12, 16, 19, 24, 28, 31]]), 523, 0.06, 0.3, 0.14, 'square');
+        for (const s of [0, 4, 7, 12]) this.tone('sawtooth', 261 * 2 ** (s / 12), 261 * 2 ** (s / 12), 1.4, 0.05, { when: 0.5, attack: 0.03, filter: { type: 'lowpass', freq: 3000 } });
+        this.tone('sine', 110, 40, 0.6, 0.4);
+        for (let k = 0; k < 6; k++) this.noise(0.25, 0.06, 'highpass', 6000, 10000, { when: 0.1 + k * 0.15 });
+        break;
+      case 'tension': {
+        // Rising ticks while the last reel keeps spinning.
+        this.pitch = 1;
+        const f = 520 * 2 ** ((opts.count ?? 0) / 12);
+        this.tone('square', f, f, 0.05, 0.05, { filter: { type: 'lowpass', freq: 3000 } });
+        this.tone('sine', f / 2, f / 2, 0.08, 0.05);
         break;
       }
       case 'noMatch':
@@ -327,46 +372,64 @@ export class AudioEngine {
         this.tone('sine', 420, 260, 0.08, 0.12);
         this.noise(0.05, 0.06, 'lowpass', 1500, 600);
         break;
-      case 'beam':
-        this.tone('sawtooth', 1700, 260, 0.13, 0.06, { filter: { type: 'bandpass', freq: 1800, q: 2 } });
-        this.tone('sine', 2600, 900, 0.08, 0.04);
+      case 'beam': {
+        // Beam rifle: waveform, sweep, length and tone change every shot.
+        const f0 = rnd(1400, 2300);
+        const dur = rnd(0.1, 0.17);
+        this.tone(pick(['sawtooth', 'square', 'sawtooth'] as OscillatorType[]), f0, rnd(180, 380), dur, 0.06, { filter: { type: 'bandpass', freq: rnd(1300, 2400), q: rnd(1.5, 3) } });
+        this.tone('sine', f0 * rnd(1.4, 1.8), rnd(700, 1100), dur * 0.6, 0.04);
+        if (Math.random() < 0.3) this.tone('square', rnd(3000, 4200), rnd(1500, 2200), 0.04, 0.025, { when: 0.02 });
         break;
-      case 'pellet':
-        this.tone('square', 1100, 600, 0.05, 0.035);
+      }
+      case 'pellet': {
+        const f = rnd(900, 1350);
+        this.tone(pick(['square', 'triangle'] as OscillatorType[]), f, f * rnd(0.45, 0.6), rnd(0.04, 0.065), 0.035);
         break;
+      }
       case 'shell':
-        this.tone('sine', 110, 50, 0.22, 0.35);
-        this.noise(0.12, 0.12, 'lowpass', 1200, 300);
+        this.tone('sine', rnd(95, 130), rnd(42, 58), rnd(0.18, 0.26), 0.35);
+        this.noise(rnd(0.1, 0.15), 0.12, 'lowpass', rnd(900, 1500), 300);
         break;
-      case 'explosion':
-        this.noise(0.45, 0.32, 'lowpass', 1400, 150);
-        this.tone('sine', 80, 30, 0.35, 0.3);
+      case 'explosion': {
+        const dur = rnd(0.35, 0.6);
+        this.noise(dur, rnd(0.26, 0.36), 'lowpass', rnd(1000, 1900), rnd(120, 200));
+        this.tone('sine', rnd(65, 95), rnd(26, 36), dur * 0.8, 0.3);
+        if (Math.random() < 0.4) this.noise(0.18, 0.08, 'bandpass', rnd(2000, 3000), 800, { when: rnd(0.04, 0.12) });
         break;
+      }
       case 'bigExplosion':
         this.noise(1.1, 0.55, 'lowpass', 2200, 90);
         this.tone('sine', 65, 22, 0.9, 0.5);
         this.noise(0.5, 0.2, 'bandpass', 900, 200, { when: 0.12 });
         break;
       case 'enemyDie':
-        this.noise(0.28, 0.22, 'lowpass', 1800, 250);
-        this.tone('square', 300, 80, 0.15, 0.04);
+        this.noise(rnd(0.22, 0.34), 0.22, 'lowpass', rnd(1400, 2200), 250);
+        this.tone('square', rnd(240, 360), rnd(60, 100), rnd(0.12, 0.18), 0.04);
         break;
-      case 'slash':
-        this.noise(0.13, 0.16, 'bandpass', 2500, 6500, { filter: { type: 'bandpass', freq: 2500, q: 1.5 } });
-        this.tone('sawtooth', 900, 2200, 0.09, 0.03);
+      case 'slash': {
+        const lo = rnd(2000, 3200);
+        this.noise(rnd(0.1, 0.16), 0.16, 'bandpass', lo, lo * rnd(2, 2.8), { filter: { type: 'bandpass', freq: lo, q: 1.5 } });
+        this.tone('sawtooth', rnd(800, 1100), rnd(1900, 2600), rnd(0.07, 0.11), 0.03);
         break;
-      case 'mechHit':
-        this.tone('square', 160, 90, 0.07, 0.07, { filter: { type: 'lowpass', freq: 1200 } });
-        this.noise(0.05, 0.08, 'bandpass', 1200, 800);
+      }
+      case 'mechHit': {
+        const f = rnd(130, 195);
+        this.tone('square', f, f * 0.55, rnd(0.06, 0.09), 0.07, { filter: { type: 'lowpass', freq: rnd(900, 1500) } });
+        this.noise(0.05, 0.08, 'bandpass', rnd(900, 1500), 800);
         break;
-      case 'enemyShot':
-        this.noise(0.04, 0.06, 'highpass', 2500, 2000);
-        this.tone('square', 650, 380, 0.04, 0.025);
+      }
+      case 'enemyShot': {
+        const f = rnd(520, 820);
+        this.noise(0.04, 0.06, 'highpass', rnd(2000, 3200), 2000);
+        this.tone(pick(['square', 'sawtooth'] as OscillatorType[]), f, f * 0.58, rnd(0.03, 0.05), 0.025);
         break;
-      case 'sniper':
-        this.tone('sawtooth', 2800, 180, 0.32, 0.06, { filter: { type: 'lowpass', freq: 5000, to: 600 } });
-        this.tone('sine', 1400, 1400, 0.05, 0.05);
+      }
+      case 'sniper': {
+        const f = rnd(2400, 3300);
+        this.tone('sawtooth', f, rnd(150, 240), rnd(0.26, 0.38), 0.06, { filter: { type: 'lowpass', freq: 5000, to: 600 } });
+        this.tone('sine', f / 2, f / 2, 0.05, 0.05);
         break;
+      }
       case 'baseHit':
         this.pitch = 1;
         this.tone('square', 440, 440, 0.12, 0.08, { filter: { type: 'lowpass', freq: 2000 } });

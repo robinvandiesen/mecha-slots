@@ -8,6 +8,8 @@ import {
   MECHS,
   MECH_TYPES,
   baseModifiers,
+  baseDamageFor,
+  enemyDmgScale,
   enemyHpScale,
   waveRoster,
   waveSpawns,
@@ -19,11 +21,12 @@ import {
   type Spawn,
   type SymbolId,
 } from './data';
-import { DEPLOY_X, LX, LY, MAX_UNITS, ROWS, clampToDeploy, project, screenXToWorld, slotCellRect, type Vec } from './layout';
+import { DEPLOY_X, FIELD_X, LX, LY, MAX_UNITS, ROWS, W, clampToDeploy, slotCellRect, type Vec } from './layout';
+import { MUZZLE, enemyHeight, mechScale } from './dims';
+import { project } from './view';
 import type { Sfx } from './audio';
 import { findLines, rollGrid, rollSymbol, type LineMatch } from './slot';
-import { ENEMY_SCALE, MUZZLE, enemyHeight, mechScale } from './sprites';
-import { ARMORY_SIZE, EQUIPMENT, equipById, variantById, variantsFor, type EquipId, type Special, type StatMods, type VariantDef } from './upgrades';
+import { ARMORY_SIZE, BOOST_MAX, EQUIPMENT, boostCost, boostDef, emptyBoosts, equipById, variantById, variantsFor, type BoostId, type EquipId, type Special, type StatMods, type VariantDef } from './upgrades';
 
 export type Phase = 'build' | 'spinning' | 'combat' | 'reward' | 'over' | 'victory';
 
@@ -48,10 +51,15 @@ export interface Mech {
   hy: number;
   flip: boolean;
   moving: boolean;
+  /** Facing direction on the deck in radians (0 = towards the enemy edge). */
+  face: number;
   /** Chosen specialisations. */
   mk2: string | null;
   mk3: string | null;
   equipment: EquipId[];
+  /** Scrap upgrade ranks, and the scrap spent on them (half is refunded on salvage). */
+  boosts: Record<BoostId, number>;
+  boostSpent: number;
 }
 
 export interface Enemy {
@@ -67,6 +75,19 @@ export interface Enemy {
   attack: number;
   dead: boolean;
   flip: boolean;
+  /** Facing direction on the deck in radians (PI = towards the mothership). */
+  face: number;
+  /** Cooldown of the ranged attack, for enemies that have one. */
+  rcd: number;
+}
+
+/** A 3D explosion requested by the game logic (the scene consumes these each frame). */
+export interface Blast {
+  x: number;
+  y: number;
+  h: number;
+  size: number;
+  color: string;
 }
 
 export interface Projectile {
@@ -127,8 +148,55 @@ export interface Floater {
 export interface Reel {
   result: SymbolId[];
   t: number;
+  /** When each column (reel) stops; the reels stop in a random order. */
   stops: number[];
+  /** Column order in which the reels stop, and the column that stops last. */
+  order: number[];
+  last: number;
+  /** Spin speed of each reel, in symbols per second. */
+  speeds: number[];
   strips: SymbolId[][];
+  /** The first two reels to stop genuinely line up, so the last reel spins longer for suspense. */
+  anticipation: boolean;
+  /** Last suspense tick played (for the rising pitch). */
+  tension: number;
+}
+
+export type WinTier = 'none' | 'scrap' | 'win' | 'big' | 'jackpot';
+
+/** Slot machine celebration state, read by the renderer. */
+export interface WinFx {
+  t: number;
+  tier: WinTier;
+  label: string;
+  sub: string;
+  lines: LineMatch[];
+}
+
+/** Rows and diagonals span all three reels (one cell per column, in column order); columns sit on one reel, so they can't build suspense. */
+const CROSS_REEL_LINES = [
+  [0, 1, 2],
+  [3, 4, 5],
+  [6, 7, 8],
+  [0, 4, 8],
+  [6, 4, 2],
+];
+
+/** Lines where the two reels other than `last` show the same mech: a real pair the last reel could complete. */
+function mechPairs(grid: SymbolId[], last: number): number {
+  return CROSS_REEL_LINES.filter((line) => {
+    const [a, b] = line.filter((_, col) => col !== last).map((i) => grid[i]);
+    return a === b && a !== 'wild' && a !== 'scrap';
+  }).length;
+}
+
+function shuffled<T>(items: T[]): T[] {
+  const a = [...items];
+  for (let k = a.length - 1; k > 0; k--) {
+    const j = Math.floor(Math.random() * (k + 1));
+    [a[k], a[j]] = [a[j], a[k]];
+  }
+  return a;
 }
 
 export interface MechStats {
@@ -179,10 +247,16 @@ const START_SCRAP = 25;
 const HANGAR_FULL_SCRAP = 5;
 const SCRAP_LINE = 10;
 const SPAWN_TIME = 0.6;
+/** The slot machine can be spun at most this many times per wave. */
+export const MAX_SPINS_PER_WAVE = 6;
 /** How far beyond its weapon range a unit can spot enemies. */
 const SIGHT = 160;
-/** Units stop advancing here, just short of the enemy spawn edge. */
-const FRONT_LINE = LX - 40;
+/** Enemies count as on the field once they are past the red spawn strip. */
+const ENTRY_X = LX - 16;
+/** With nothing to fight, units wait here, well short of the spawn edge, so they can't camp it. */
+const FRONT_LINE = LX - 130;
+/** Units chasing an enemy can go right up to the spawn strip, leaving room for enemies to step onto the field. */
+const CHASE_LIMIT = ENTRY_X - 40;
 
 function dist(a: Vec, b: Vec): number {
   return Math.hypot(a.x - b.x, a.y - b.y);
@@ -211,10 +285,17 @@ export class Game {
   projectiles: Projectile[] = [];
   particles: Particle[] = [];
   effects: Effect[] = [];
+  blasts: Blast[] = [];
   floaters: Floater[] = [];
   mods: Modifiers = baseModifiers();
   cores: CoreDef[] = [];
   reel: Reel | null = null;
+  winFx: WinFx | null = null;
+  /** Particles for the slot machine panel (confetti, sparks), in screen space. */
+  uiParticles: Particle[] = [];
+  panelShake = 0;
+  panelFlash = 0;
+  spinPress = 0;
   lastGrid: SymbolId[] = rollGrid(baseModifiers().weights);
   lineFlash: { lines: LineMatch[]; t: number } | null = null;
   rewardChoices: RewardOption[] = [];
@@ -227,13 +308,15 @@ export class Game {
   speed = 1;
   time = 0;
   hover: number | null = null;
+  /** Unit clicked by the player; shows its action card (upgrade, salvage). */
+  selected: number | null = null;
   drag: { from: number; x: number; y: number } | null = null;
   message = 'Match a line on the reels to launch a unit';
   messageT = 4;
   shake = 0;
   kills = 0;
   /** Sound hook. The app plugs the audio engine in here; simulations leave it silent. */
-  sound: (name: Sfx, opts?: { count?: number }) => void = () => {};
+  sound: (name: Sfx, opts?: { count?: number; pan?: number }) => void = () => {};
 
   constructor() {
     // A starter squad so wave 1 is survivable before your first win.
@@ -242,13 +325,17 @@ export class Game {
     for (const m of this.bays) if (m) m.spawn = 0;
   }
 
-  /** Each spin costs more than the last. The extra resets when a new wave starts. */
+  /** Each spin costs 2 more than the last; the base rises by 1 every wave. The extra resets when a new wave starts. */
   get spinCost(): number {
-    return 2 + Math.floor((this.wave - 1) / 2) + this.spinsThisWave;
+    return 4 + (this.wave - 1) + 2 * this.spinsThisWave;
+  }
+
+  spinsLeft(): number {
+    return MAX_SPINS_PER_WAVE - this.spinsThisWave;
   }
 
   canSpin(): boolean {
-    return this.phase === 'build' && !this.upgradeChoice() && this.scrap >= this.spinCost;
+    return this.phase === 'build' && !this.upgradeChoice() && this.spinsLeft() > 0 && this.scrap >= this.spinCost;
   }
 
   stats(m: Mech): MechStats {
@@ -265,6 +352,11 @@ export class Game {
       if (v.special) specials.push(v.special);
     }
     for (const id of m.equipment) sources.push(equipById(id).mods);
+    for (const [id, rank] of Object.entries(m.boosts) as [BoostId, number][]) {
+      if (!rank) continue;
+      const per = boostDef(id, m.type).perRank;
+      sources.push(Object.fromEntries(Object.entries(per).map(([k, v]) => [k, (v as number) * rank])) as StatMods);
+    }
     const mul = (key: keyof StatMods) => sources.reduce((acc, src) => acc * (1 + (src[key] ?? 0)), 1);
     const regenPct = sources.reduce((acc, src) => acc + (src.regenPct ?? 0), 0);
 
@@ -354,14 +446,67 @@ export class Game {
     this.scrap -= this.spinCost;
     this.spinsThisWave++;
     this.lineFlash = null;
+    this.winFx = null;
+    this.spinPress = 0.15;
+    const result = rollGrid(this.mods.weights);
+    // Reels stop in a random order, with a little random timing, so no two spins feel the same.
+    const order = shuffled([0, 1, 2]);
+    const last = order[2];
+    // Suspense only on a genuine pair, and not every time, so it stays special:
+    // always for two pairs, sometimes for one.
+    const pairs = mechPairs(result, last);
+    const anticipation = pairs >= 2 || (pairs === 1 && Math.random() < 0.3);
+    const stops = [0, 0, 0];
+    let at = 0.5 + Math.random() * 0.2;
+    order.forEach((col, k) => {
+      if (k > 0) at += 0.2 + Math.random() * 0.18;
+      if (k === 2 && anticipation) at += 0.9;
+      stops[col] = at;
+    });
     this.reel = {
-      result: rollGrid(this.mods.weights),
+      result,
       t: 0,
-      stops: [0.6, 0.85, 1.1],
+      stops,
+      order,
+      last,
+      speeds: [0, 1, 2].map(() => 13 + Math.random() * 6),
       strips: [0, 1, 2].map(() => Array.from({ length: 40 }, () => rollSymbol(this.mods.weights))),
+      anticipation,
+      tension: 0,
     };
     this.phase = 'spinning';
-    this.sound('spinStart');
+    this.sound('spinStart', { pan: -0.45 });
+  }
+
+  /** Plays a sound panned to where it happens on the battlefield. */
+  private soundAt(name: Sfx, x: number, y: number): void {
+    const sx = project(x, y).x;
+    this.sound(name, { pan: Math.max(-0.85, Math.min(0.85, ((sx - FIELD_X) / (W - FIELD_X)) * 1.7 - 0.85)) });
+  }
+
+  private reelStopped(col: number): void {
+    // Each reel has its own thud (by stop order) and sits slightly left (the slot machine is on the left).
+    const order = this.reel ? this.reel.order.indexOf(col) : 0;
+    this.sound('reelStop', { count: order, pan: -0.6 + col * 0.15 });
+    this.panelShake = Math.max(this.panelShake, col === this.reel?.last && this.reel.anticipation ? 7 : 3);
+    for (let row = 0; row < 3; row++) {
+      const r = slotCellRect(row * 3 + col);
+      for (let k = 0; k < 4; k++) this.uiParticle(r.x + Math.random() * r.w, r.y + r.h, (Math.random() - 0.5) * 160, -60 - Math.random() * 120, '#ffe066', 2 + Math.random() * 2, 0.35);
+    }
+  }
+
+  private uiParticle(x: number, y: number, vx: number, vy: number, color: string, size: number, life: number): void {
+    this.uiParticles.push({ x, y, vx, vy, color, size, life, max: life, gravity: 500 });
+  }
+
+  /** Confetti fountain from the reels; scrap wins throw grey cogs. */
+  private confetti(count: number, colors: string[]): void {
+    const r = slotCellRect(4);
+    for (let k = 0; k < count; k++) {
+      const a = -Math.PI / 2 + (Math.random() - 0.5) * 2.2;
+      const v = 260 + Math.random() * 380;
+      this.uiParticle(r.x + r.w / 2 + (Math.random() - 0.5) * 60, r.y + r.h / 2, Math.cos(a) * v, Math.sin(a) * v, colors[k % colors.length], 3 + Math.random() * 4, 1 + Math.random() * 0.9);
+    }
   }
 
   private resolveSpin(): void {
@@ -382,7 +527,7 @@ export class Game {
 
     const lines = findLines(grid);
     if (!lines.length) {
-      this.floater(cx, cy, 'NO MATCH', '#8a93a3', 16);
+      this.winFx = { t: 0, tier: 'none', label: 'NO MATCH', sub: '', lines: [] };
       this.sound('noMatch');
       return;
     }
@@ -392,23 +537,38 @@ export class Game {
       const from = { x: mid.x + mid.w / 2, y: mid.y + mid.h / 2 };
       if (line.symbol === 'scrap') {
         this.addScrap(SCRAP_LINE, from.x, from.y - 20);
-        this.floater(from.x, from.y - 40, 'SCRAP LINE!', '#d6dde8', 16);
         continue;
       }
       if (line.symbol === 'wild') {
         const type = MECH_TYPES[Math.floor(Math.random() * MECH_TYPES.length)];
         this.deploy(type, 2, from);
-        this.floater(from.x, from.y - 40, 'CORE LINE! ELITE', '#c77dff', 16);
         continue;
       }
       const type = line.symbol as MechType;
       this.deploy(type, 1, from);
       if (Math.random() < this.mods.extraUnit) this.deploy(type, 1, from);
-      this.floater(from.x, from.y - 40, 'LAUNCH!', '#ffe066', 16);
     }
     this.lineFlash = { lines, t: 2 };
-    this.sound('win', { count: lines.length });
-    this.shake = 6;
+    this.celebrate(lines);
+  }
+
+  private celebrate(lines: LineMatch[]): void {
+    const units = lines.filter((l) => l.symbol !== 'scrap').length;
+    const core = lines.some((l) => l.symbol === 'wild');
+    const tier: WinTier = core || lines.length >= 3 ? 'jackpot' : lines.length === 2 ? 'big' : units ? 'win' : 'scrap';
+    const label = { jackpot: 'JACKPOT!', big: 'BIG WIN!', win: 'LAUNCH!', scrap: 'SCRAP!', none: '' }[tier];
+    const parts: string[] = [];
+    if (units) parts.push(`${units} unit${units > 1 ? 's' : ''} launching`);
+    if (core) parts.push('elite unit');
+    if (lines.length - units) parts.push(`+${SCRAP_LINE * (lines.length - units)} scrap`);
+    this.winFx = { t: 0, tier, label, sub: parts.join(' · '), lines };
+
+    const colors = tier === 'scrap' ? ['#9aa4b5', '#d6dde8', '#7d8798'] : ['#ffe066', '#ff5ad8', '#6dffb8', '#5b8cff', '#ffffff', '#c77dff'];
+    this.confetti({ jackpot: 140, big: 80, win: 45, scrap: 30, none: 0 }[tier], colors);
+    this.panelFlash = tier === 'jackpot' ? 0.5 : 0.3;
+    this.panelShake = tier === 'jackpot' ? 12 : tier === 'big' ? 8 : 5;
+    this.sound(tier === 'jackpot' ? 'jackpot' : 'win', { count: lines.length });
+    this.shake = tier === 'jackpot' ? 10 : 6;
   }
 
   /** Finds an open spot in the deployment zone, away from other units and towards the rear. */
@@ -458,9 +618,12 @@ export class Game {
       hy: home.y,
       flip: false,
       moving: false,
+      face: 0,
       mk2: null,
       mk3: null,
       equipment: [],
+      boosts: emptyBoosts(),
+      boostSpent: 0,
     };
     m.hp = this.stats(m).maxHp;
     this.bays[i] = m;
@@ -500,6 +663,9 @@ export class Game {
       this.bays[from] = null;
       this.addXp(b, mergeValue(a), to);
       this.sound(this.pendingUpgrades.includes(to) ? 'promote' : 'merge');
+      // Scrap upgrades add together, so nothing spent is wasted (up to the maximum rank).
+      for (const id of Object.keys(b.boosts) as BoostId[]) b.boosts[id] = Math.min(BOOST_MAX, b.boosts[id] + a.boosts[id]);
+      b.boostSpent += a.boostSpent;
       for (const id of a.equipment) {
         if (b.equipment.length < slotsFor(b.level)) b.equipment.push(id);
         else this.stashItem(id, pos);
@@ -531,10 +697,38 @@ export class Game {
     m.x = m.hx = at.x;
     m.y = m.hy = at.y;
     m.flip = false;
+    m.face = 0;
+  }
+
+  /** Scrap for the next rank of a scrap upgrade on this mech. */
+  boostCost(m: Mech, id: BoostId): number {
+    return boostCost(m.boosts[id]);
+  }
+
+  canBoost(i: number, id: BoostId): boolean {
+    const m = this.bays[i];
+    return this.canDrag(i) && !!m && m.boosts[id] < BOOST_MAX && this.scrap >= this.boostCost(m, id);
+  }
+
+  /** Buys one rank of a scrap upgrade (Firepower, Armour, Reactor or Thrusters). */
+  boost(i: number, id: BoostId): void {
+    const m = this.bays[i];
+    if (!m || !this.canBoost(i, id)) return;
+    const cost = this.boostCost(m, id);
+    this.scrap -= cost;
+    m.boostSpent += cost;
+    m.boosts[id]++;
+    m.hp = this.stats(m).maxHp;
+    const def = boostDef(id, m.type);
+    const pos = this.screenPos(m);
+    this.floater(pos.x, pos.y - 95, `${def.name.toUpperCase()} ${m.boosts[id]}`, def.color, 13);
+    this.burst(pos.x, pos.y - 35, def.color, 18, 150);
+    this.effects.push({ kind: 'ring', x: pos.x, y: pos.y - 35, r: 46, color: def.color, life: 0.35, max: 0.35 });
+    this.sound('equip');
   }
 
   salvageValue(m: Mech): number {
-    return 2 * mergeValue(m);
+    return 2 * mergeValue(m) + Math.floor(m.boostSpent / 2);
   }
 
   salvage(i: number): void {
@@ -574,6 +768,7 @@ export class Game {
 
   launch(): void {
     if (this.phase !== 'build' || this.upgradeChoice()) return;
+    this.selected = null;
     this.dragItem = null;
     this.phase = 'combat';
     this.drag = null;
@@ -632,9 +827,21 @@ export class Game {
     if (this.phase === 'spinning' && this.reel) {
       const before = this.reel.t;
       this.reel.t += dt;
-      for (const stop of this.reel.stops) if (before < stop && this.reel.t >= stop) this.sound('reelStop');
-      if (this.reel.t < this.reel.stops[2]) this.sound('tick');
-      if (this.reel.t >= this.reel.stops[2] + 0.2) this.resolveSpin();
+      this.reel.stops.forEach((stop, col) => {
+        if (before < stop && this.reel!.t >= stop) this.reelStopped(col);
+      });
+      const r = this.reel;
+      const second = r.stops[r.order[1]];
+      const final = r.stops[r.last];
+      if (r.anticipation && r.t > second && r.t < final) {
+        // Suspense: ticks speed up and rise in pitch until the last reel lands.
+        const step = Math.floor(((r.t - second) / (final - second)) * 14);
+        if (step > r.tension) {
+          r.tension = step;
+          this.sound('tension', { count: step, pan: -0.45 });
+        }
+      } else if (r.t < final) this.sound('tick');
+      if (this.reel.t >= final + 0.2) this.resolveSpin();
     }
 
     const steps = this.phase === 'combat' ? this.speed : 1;
@@ -651,7 +858,7 @@ export class Game {
       const s = this.spawnQueue.shift()!;
       const hp = ENEMIES[s.type].hp * enemyHpScale(this.wave);
       const lane = ((s.row + 0.5) / ROWS) * LY + (Math.random() - 0.5) * 40;
-      this.enemies.push({ type: s.type, x: LX + 20, y: lane, lane, hp, maxHp: hp, cd: 0.5, flash: 0, attack: 0, dead: false, flip: false });
+      this.enemies.push({ type: s.type, x: LX + 20, y: lane, lane, hp, maxHp: hp, cd: 0.5, flash: 0, attack: 0, dead: false, flip: false, face: Math.PI, rcd: 1.5 });
     }
 
     for (const m of this.bays) if (m && !m.wrecked) this.updateMech(m, this.stats(m), dt);
@@ -685,7 +892,7 @@ export class Game {
     let target: Enemy | null = null;
     let best = Infinity;
     for (const e of this.enemies) {
-      if (e.dead || !this.canHit(m, e)) continue;
+      if (e.dead || e.x > ENTRY_X || !this.canHit(m, e)) continue;
       const gap = dist(m, e) - MECH_RADIUS - ENEMIES[e.type].radius;
       if (gap > st.range + SIGHT) continue;
       // Never turn round to chase: enemies behind us only count if we can shoot them from here.
@@ -701,6 +908,7 @@ export class Game {
     m.moving = false;
     if (target) {
       m.flip = project(target.x, target.y).x < project(m.x, m.y).x;
+      m.face = Math.atan2(target.y - m.y, target.x - m.x);
       const gap = dist(m, target) - MECH_RADIUS - ENEMIES[target.type].radius;
       if (gap <= st.range) {
         if (m.cd <= 0) {
@@ -717,10 +925,14 @@ export class Game {
       return;
     }
 
-    // Nothing to fight: keep advancing towards the enemy edge.
+    // Nothing in reach: advance towards the enemy edge, but only once enemies are on the field.
     m.flip = false;
-    if (st.speed > 0 && m.x < FRONT_LINE) {
-      m.x = Math.min(FRONT_LINE, m.x + st.speed * dt);
+    m.face = 0;
+    const enemiesOnField = this.enemies.some((e) => !e.dead && e.x <= ENTRY_X);
+    // Lancers march all the way to the end; other mechs wait in mid-field.
+    const limit = m.type === 'lancer' ? CHASE_LIMIT : FRONT_LINE;
+    if (enemiesOnField && st.speed > 0 && m.x < limit) {
+      m.x = Math.min(limit, m.x + st.speed * dt);
       m.moving = true;
     }
   }
@@ -749,49 +961,88 @@ export class Game {
     const def = ENEMIES[e.type];
     e.attack = Math.max(0, e.attack - dt * 4);
     e.cd -= dt;
+    e.rcd -= dt;
 
     if (def.heal) this.healAround(e, dt);
 
-    const target = this.enemyTarget(e);
+    // Enemies march onto the field before they can engage (and be engaged).
+    const target = e.x > ENTRY_X ? null : this.enemyTarget(e);
     if (target) {
       const { m, i, gap } = target;
       e.flip = project(m.x, m.y).x > project(e.x, e.y).x;
+      e.face = Math.atan2(m.y - e.y, m.x - e.x);
       if (gap > def.range) {
         stepTowards(e, m, def.speed * dt);
+        // Bosses shell targets with their cannon while closing in.
+        if (def.ranged && gap <= def.ranged.range && e.rcd <= 0) this.fireCannon(e, { x: m.x, y: m.y }, i);
       } else if (def.explode) {
         this.explodeBomber(e);
         return;
       } else if (e.cd <= 0) {
         e.cd = def.cooldown;
         e.attack = 1;
-        const from = project(e.x, e.y);
-        const to = project(m.x, m.y);
-        const fy = from.y - enemyHeight(e.type) * 0.55;
-        const fx = from.x + (e.flip ? 1 : -1) * def.radius;
-        if (e.type === 'sniper') this.effects.push({ kind: 'tracer', x: fx, y: fy, tx: to.x, ty: to.y - 30, r: 3, color: '#ff3b7f', life: 0.18, max: 0.18 });
-        else if (def.range > 30) this.effects.push({ kind: 'tracer', x: fx, y: fy, tx: to.x, ty: to.y - 30, r: 0, color: '#ffef5c', life: 0.08, max: 0.08 });
+        const from = project(e.x + Math.cos(e.face) * def.radius, e.y + Math.sin(e.face) * def.radius, enemyHeight(e.type) * 0.55);
+        const to = project(m.x, m.y, 30);
+        const fy = from.y;
+        const fx = from.x;
+        if (e.type === 'sniper') this.effects.push({ kind: 'tracer', x: fx, y: fy, tx: to.x, ty: to.y, r: 3, color: '#ff3b7f', life: 0.18, max: 0.18 });
+        else if (def.range > 30) this.effects.push({ kind: 'tracer', x: fx, y: fy, tx: to.x, ty: to.y, r: 0, color: '#ffef5c', life: 0.08, max: 0.08 });
         this.particle(fx, fy, 0, 0, e.type === 'sniper' ? '#ff9ae6' : '#ffef5c', 7, 0.08, 0);
-        this.sound(e.type === 'sniper' ? 'sniper' : def.range > 30 ? 'enemyShot' : 'mechHit');
-        this.damageMech(i, def.dmg);
+        this.soundAt(e.type === 'sniper' ? 'sniper' : def.range > 30 ? 'enemyShot' : 'mechHit', e.x, e.y);
+        this.damageMech(i, def.dmg * enemyDmgScale(this.wave));
       }
     } else {
       e.flip = false;
+      e.face = Math.PI;
       // Repair units hang back behind the front line.
       const ahead = def.heal ? this.enemies.some((o) => o !== e && !o.dead && o.x < e.x && o.x > e.x - 140) : true;
       if (ahead || e.x > 200) e.x -= def.speed * dt;
+      // With nothing to fight, a boss in range shells the mothership.
+      if (def.ranged && e.x <= ENTRY_X && e.x < def.ranged.range && e.rcd <= 0) this.fireCannon(e, { x: 0, y: e.y }, null);
       e.y += (e.lane - e.y) * Math.min(1, dt * (def.flying ? 0.3 : 0.8));
     }
 
     e.y = Math.max(8, Math.min(LY - 8, e.y));
     if (e.x <= def.radius) {
       e.dead = true;
-      this.sound('baseHit');
-      this.baseHp = Math.max(0, this.baseHp - def.baseDamage);
+      this.sound('baseHit', { pan: -0.5 });
+      const hit = baseDamageFor(def.baseDamage, this.wave);
+      this.baseHp = Math.max(0, this.baseHp - hit);
       this.shake = 10;
       const p = project(0, e.y);
       this.burst(p.x, p.y - 30, '#ff3b6b', 24, 200);
-      this.floater(p.x + 20, p.y - 60, `-${def.baseDamage}`, '#ff3b6b', 16);
+      this.floater(p.x + 20, p.y - 60, `-${hit}`, '#ff3b6b', 16);
     }
+  }
+
+  /** Boss cannon: a heavy beam that explodes on impact. `bay` is null when shelling the mothership. */
+  private fireCannon(e: Enemy, at: Vec, bay: number | null): void {
+    const def = ENEMIES[e.type];
+    const gun = def.ranged!;
+    e.rcd = gun.cooldown;
+    e.attack = 1;
+    const from = project(e.x + Math.cos(e.face) * def.radius, e.y + Math.sin(e.face) * def.radius, enemyHeight(e.type) * 0.55);
+    const to = project(at.x, at.y, bay === null ? 30 : 20);
+    this.effects.push({ kind: 'tracer', x: from.x, y: from.y, tx: to.x, ty: to.y, r: 7, color: '#ffef5c', life: 0.22, max: 0.22 });
+    this.effects.push({ kind: 'ring', x: to.x, y: to.y, r: gun.splash * 1.4, color: '#ff9d2f', life: 0.35, max: 0.35 });
+    this.burst(to.x, to.y, '#ffef5c', 22, 200);
+    this.blasts.push({ x: at.x, y: at.y, h: 18, size: gun.splash * 0.8, color: '#ffd23f' });
+    this.soundAt('sniper', e.x, e.y);
+    this.soundAt('explosion', at.x, at.y);
+    this.shake = Math.max(this.shake, 6);
+    if (bay === null) {
+      const hit = baseDamageFor(2, this.wave);
+      this.baseHp = Math.max(0, this.baseHp - hit);
+      this.floater(to.x + 20, to.y - 30, `-${hit}`, '#ff3b6b', 16);
+      this.sound('baseHit', { pan: -0.5 });
+      return;
+    }
+    // Direct hit on the target, splash on mechs around it.
+    const dmg = gun.dmg * enemyDmgScale(this.wave);
+    this.damageMech(bay, dmg);
+    this.bays.forEach((m, k) => {
+      if (m && k !== bay && !m.wrecked && dist(m, at) <= gun.splash + MECH_RADIUS) this.damageMech(k, dmg * 0.5);
+    });
   }
 
   private healAround(e: Enemy, dt: number): void {
@@ -803,8 +1054,8 @@ export class Game {
       o.hp = Math.min(o.maxHp, o.hp + amount);
       healed = true;
       if (Math.random() < dt * 3) {
-        const p = project(o.x, o.y);
-        this.particle(p.x + (Math.random() - 0.5) * 16, p.y - enemyHeight(o.type) * 0.6, 0, -40, '#6dffb8', 4, 0.5, 0);
+        const p = project(o.x, o.y, enemyHeight(o.type) * 0.6);
+        this.particle(p.x + (Math.random() - 0.5) * 16, p.y, 0, -40, '#6dffb8', 4, 0.5, 0);
       }
     }
     if (healed) this.sound('heal');
@@ -822,9 +1073,9 @@ export class Game {
     this.burst(p.x, p.y - 20, '#ffef5c', 16, 140);
     this.effects.push({ kind: 'ring', x: p.x, y: p.y - 10, r: (def.explode ?? 0) * 1.4, color: '#ff9d2f', life: 0.4, max: 0.4 });
     this.shake = Math.max(this.shake, 8);
-    this.sound('bigExplosion');
+    this.soundAt('bigExplosion', e.x, e.y);
     this.bays.forEach((m, i) => {
-      if (m && !m.wrecked && dist(m, e) <= (def.explode ?? 0) + MECH_RADIUS) this.damageMech(i, def.dmg * Math.sqrt(enemyHpScale(this.wave)));
+      if (m && !m.wrecked && dist(m, e) <= (def.explode ?? 0) + MECH_RADIUS) this.damageMech(i, def.dmg * enemyDmgScale(this.wave));
     });
   }
 
@@ -851,7 +1102,7 @@ export class Game {
     // Units only ever give way sideways or forwards, never backwards.
     mechs.forEach((m, k) => (m.x = Math.max(m.x, startX[k])));
     for (const m of mechs) {
-      m.x = Math.max(10, Math.min(FRONT_LINE, m.x));
+      m.x = Math.max(10, Math.min(CHASE_LIMIT, m.x));
       m.y = Math.max(10, Math.min(LY - 10, m.y));
     }
     for (let a = 0; a < this.enemies.length; a++) {
@@ -879,8 +1130,14 @@ export class Game {
         const min = ra + MECH_RADIUS;
         if (d >= min || d === 0) continue;
         const push = (min - d) / d;
-        A.x += (A.x - m.x) * push;
-        A.y += (A.y - m.y) * push;
+        if (A.x > ENTRY_X - 30) {
+          // An enemy still stepping onto the field: the mech gives way, so nobody gets stuck in the spawn zone.
+          m.x -= (A.x - m.x) * push;
+          m.y -= (A.y - m.y) * push;
+        } else {
+          A.x += (A.x - m.x) * push;
+          A.y += (A.y - m.y) * push;
+        }
       }
     }
   }
@@ -900,13 +1157,14 @@ export class Game {
     const attack = MECHS[m.type].attack;
     const scale = mechScale(tierOf(m.level));
     const muzzle = MUZZLE[m.type];
+    m.face = Math.atan2(target.y - m.y, target.x - m.x);
     m.recoil = 1;
 
     if (attack === 'melee') {
       this.damageEnemy(target, dmg, m, crit, true);
-      this.sound('slash');
-      const tp = project(target.x, target.y);
-      const ty = tp.y - 22 * ENEMY_SCALE[target.type];
+      this.soundAt('slash', m.x, m.y);
+      const tp = project(target.x, target.y, enemyHeight(target.type) * 0.5);
+      const ty = tp.y;
       const cleave = st.specials.includes('cleave');
       this.effects.push({ kind: 'slash', x: tp.x + (m.flip ? 6 : -6), y: ty, r: cleave ? 40 : 24, color: cleave ? '#ffb347' : '#ff5ad8', life: 0.18, max: 0.18 });
       for (let k = 0; k < 8; k++) this.particle(tp.x, ty + (Math.random() - 0.5) * 24, (m.flip ? -1 : 1) * (60 + Math.random() * 140), (Math.random() - 0.5) * 140, '#ff9ae6', 3, 0.25, 0);
@@ -918,14 +1176,13 @@ export class Game {
       return;
     }
 
-    const off = screenXToWorld(muzzle.x * scale * (m.flip ? -1 : 1));
-    const sx = m.x + off.x;
-    const sy = m.y + off.y;
-    const sz = -muzzle.y * scale;
+    const sx = m.x + Math.cos(m.face) * muzzle.fwd * scale;
+    const sy = m.y + Math.sin(m.face) * muzzle.fwd * scale;
+    const sz = muzzle.h * scale;
     if (attack === 'bullet') {
-      const tz = enemyHeight(target.type) * 0.5;
+      const tz = enemyHeight(target.type) * 0.6;
       const splash = st.specials.includes('splashShots') ? 40 : 0;
-      this.sound(m.type === 'bulwark' ? 'pellet' : 'beam');
+      this.soundAt(m.type === 'bulwark' ? 'pellet' : 'beam', m.x, m.y);
       this.projectiles.push({ kind: 'bullet', x: sx, y: sy, z: sz, sx, sy, sz, tx: target.x, ty: target.y, tz, target, dmg, splash, p: 0, duration: 0, owner: m, done: false });
       const mp = project(sx, sy);
       this.particle(mp.x, mp.y - sz, 0, 0, '#fff3a0', 6, 0.06, 0);
@@ -934,10 +1191,10 @@ export class Game {
 
     const targets = [target];
     if (st.specials.includes('multishot')) {
-      const other = this.enemies.filter((e) => e !== target && !e.dead && !ENEMIES[e.type].flying);
+      const other = this.enemies.filter((e) => e !== target && !e.dead && e.x <= ENTRY_X && !ENEMIES[e.type].flying);
       if (other.length) targets.push(other[Math.floor(Math.random() * other.length)]);
     }
-    this.sound('shell');
+    this.soundAt('shell', m.x, m.y);
     targets.forEach((t, k) => {
       // Shell: lob at where the target will roughly be on landing.
       const d = dist({ x: sx, y: sy }, t);
@@ -965,7 +1222,7 @@ export class Game {
         const hp = project(p.tx, p.ty);
         if (p.splash > 0) {
           this.burst(hp.x, hp.y - p.tz, '#ff9d2f', 16, 150);
-          this.sound('explosion');
+          this.soundAt('explosion', p.tx, p.ty);
           this.effects.push({ kind: 'ring', x: hp.x, y: hp.y - p.tz, r: p.splash * 1.2, color: '#ff9d2f', life: 0.25, max: 0.25 });
           for (const e of this.enemies) {
             if (e !== victim && !e.dead && !ENEMIES[e.type].flying && dist(e, { x: p.tx, y: p.ty }) <= p.splash + ENEMIES[e.type].radius) this.damageEnemy(e, p.dmg * 0.6, p.owner, false, false);
@@ -991,7 +1248,7 @@ export class Game {
 
     p.done = true;
     this.shake = Math.max(this.shake, 4);
-    this.sound('explosion');
+    this.soundAt('explosion', p.tx, p.ty);
     const hp = project(p.tx, p.ty);
     this.burst(hp.x, hp.y - 6, '#ff9d2f', 22, 180);
     this.burst(hp.x, hp.y - 6, '#fff3a0', 8, 90);
@@ -1003,22 +1260,24 @@ export class Game {
   }
 
   private damageEnemy(e: Enemy, rawDmg: number, owner: Mech, crit: boolean, melee: boolean): void {
-    if (e.dead) return;
+    // Enemies can't be hurt until they have entered the field (splash damage included).
+    if (e.dead || e.x > ENTRY_X) return;
     const armour = melee ? 0 : (ENEMIES[e.type].armour ?? 0);
     const dmg = rawDmg * (1 - armour);
     e.hp -= dmg;
     e.flash = 0.08;
     const sp = project(e.x, e.y);
-    if (armour > 0 && Math.random() < 0.3) this.particle(sp.x - 10, sp.y - enemyHeight(e.type) * 0.5, -30, -30, '#7df4ff', 4, 0.2, 0);
-    this.floater(sp.x + (Math.random() - 0.5) * 16, sp.y - enemyHeight(e.type) - 8, `${Math.round(dmg)}${crit ? '!' : ''}`, crit ? '#ff9d2f' : armour > 0 ? '#9fb3c8' : '#ffffff', crit ? 14 : 10);
+    const top = project(e.x, e.y, enemyHeight(e.type) + 8);
+    if (armour > 0 && Math.random() < 0.3) this.particle(sp.x - 10, (sp.y + top.y) / 2, -30, -30, '#7df4ff', 4, 0.2, 0);
+    this.floater(top.x + (Math.random() - 0.5) * 16, top.y, `${Math.round(dmg)}${crit ? '!' : ''}`, crit ? '#ff9d2f' : armour > 0 ? '#9fb3c8' : '#ffffff', crit ? 14 : 10);
     if (e.hp > 0) return;
 
     e.dead = true;
     this.kills++;
-    this.sound(e.type === 'titan' ? 'bigExplosion' : 'enemyDie');
+    this.soundAt(e.type === 'titan' ? 'bigExplosion' : 'enemyDie', e.x, e.y);
     const def = ENEMIES[e.type];
     const reward = Math.ceil(def.reward * (1 + 0.15 * (this.wave - 1))) + this.mods.killScrap + (owner.imprint?.id === 'salvager' ? 1 : 0);
-    const ey = sp.y - enemyHeight(e.type) * 0.4;
+    const ey = project(e.x, e.y, enemyHeight(e.type) * 0.4).y;
     this.addScrap(reward, sp.x, ey - 20);
     this.burst(sp.x, ey, '#c77dff', e.type === 'titan' ? 60 : 16, e.type === 'titan' ? 260 : 150);
     this.burst(sp.x, ey, '#ff9d2f', e.type === 'titan' ? 30 : 6, 120);
@@ -1041,7 +1300,7 @@ export class Game {
     if (m.hp > 0) return;
     m.hp = 0;
     m.wrecked = true;
-    this.sound('explosion');
+    this.soundAt('explosion', m.x, m.y);
     m.moving = false;
     this.shake = 8;
     this.burst(pos.x, pos.y - 25, '#ff9d2f', 30, 200);
@@ -1050,7 +1309,7 @@ export class Game {
   }
 
   private endWave(): void {
-    this.bays.forEach((m, i) => {
+    this.bays.forEach((m) => {
       if (!m || !m.wrecked) return;
       const pos = this.screenPos(m);
       if (m.level > 1) {
@@ -1062,9 +1321,9 @@ export class Game {
         this.trimEquipment(m);
         this.floater(pos.x, pos.y - 70, 'REBUILT -1 LV', '#ffb347', 12);
       } else {
-        for (const id of m.equipment) this.stashItem(id);
-        this.bays[i] = null;
-        this.floater(pos.x, pos.y - 70, 'LOST', '#ff3b6b', 13);
+        // Level 1 can't drop any lower: the unit is simply rebuilt and stays in the army.
+        m.wrecked = false;
+        this.floater(pos.x, pos.y - 70, 'REBUILT', '#ffb347', 12);
       }
     });
     // Everyone is recalled to where the player placed them.
@@ -1074,11 +1333,13 @@ export class Game {
       m.x = m.hx;
       m.y = m.hy;
       m.flip = false;
+      m.face = 0;
       m.moving = false;
       const p = project(m.x, m.y);
       this.effects.push({ kind: 'drop', x: p.x, y: p.y, r: 0, color: MECHS[m.type].colors.main, life: 0.35, max: 0.35 });
     }
     this.projectiles = [];
+    this.blasts = [];
 
     this.scrap += 12 + 3 * this.wave;
     if (this.wave < MAX_WAVE) this.sound('waveClear');
@@ -1097,6 +1358,21 @@ export class Game {
   }
 
   private updateEffects(dt: number): void {
+    if (this.winFx) {
+      this.winFx.t += dt;
+      if (this.winFx.t > (this.winFx.tier === 'none' ? 0.8 : 2.6)) this.winFx = null;
+    }
+    this.panelShake = Math.max(0, this.panelShake - dt * 40);
+    this.panelFlash = Math.max(0, this.panelFlash - dt * 1.8);
+    this.spinPress = Math.max(0, this.spinPress - dt);
+    for (const p of this.uiParticles) {
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.vy += p.gravity * dt;
+      p.vx *= 1 - dt * 0.8;
+      p.life -= dt;
+    }
+    this.uiParticles = this.uiParticles.filter((p) => p.life > 0);
     for (const p of this.particles) {
       p.x += p.vx * dt;
       p.y += p.vy * dt;

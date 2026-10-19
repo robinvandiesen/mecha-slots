@@ -1,10 +1,12 @@
-import { BOSS_WAVES, ENEMIES, MAX_LEVEL, MAX_WAVE, MECHS, MECH_TYPES, SYMBOLS, SYMBOL_COLORS, SYMBOL_NAMES, waveRoster, waveSpawns, type EnemyType, type SymbolId } from './data';
-import { className, slotsFor, tierOf, xpToNext, type Game, type Mech } from './game';
-import { DEPLOY_X, FIELD_TOP, FIELD_X, H, LX, LY, MAX_UNITS, PANEL_W, ROWS, SLOT, W, clampToDeploy, project, slotCellRect, unproject, type Vec } from './layout';
+import { BOSS_WAVES, ENEMIES, MAX_LEVEL, MAX_WAVE, MECHS, MECH_TYPES, SYMBOLS, SYMBOL_COLORS, SYMBOL_NAMES, enemyDmgScale, enemyHpScale, waveRoster, waveSpawns, type EnemyType, type SymbolId } from './data';
+import { MAX_SPINS_PER_WAVE, className, slotsFor, tierOf, xpToNext, type Game, type Mech } from './game';
+import { MECH_HEIGHT, enemyHeight, mechScale } from './dims';
+import { FIELD_TOP, FIELD_X, H, MAX_UNITS, PANEL_W, SLOT, W, clampToDeploy, slotCellRect, type Vec } from './layout';
 import { winChance } from './slot';
-import { MECH_HEIGHT, drawEnemy, drawEquipIcon, drawMech, drawSymbol, enemyHeight, mechScale } from './sprites';
+import { drawEquipIcon, drawMech, drawSymbol } from './sprites';
+import { project, unproject } from './view';
 import type { AudioEngine } from './audio';
-import { ARMORY_SIZE, SPECIAL_TEXT, equipById, variantById, type EquipId, type VariantDef } from './upgrades';
+import { ARMORY_SIZE, BOOST_IDS, BOOST_MAX, SPECIAL_TEXT, boostDef, equipById, variantById, type EquipId, type VariantDef } from './upgrades';
 
 export interface Button {
   x: number;
@@ -96,19 +98,17 @@ export function isOverPanel(p: { x: number; y: number }): boolean {
 }
 
 export function render(ctx: CanvasRenderingContext2D, g: Game, rc: RenderContext): void {
-  ctx.fillStyle = '#0b0e15';
-  ctx.fillRect(0, 0, W, H);
-
-  ctx.save();
-  if (g.shake > 0) ctx.translate((Math.random() - 0.5) * g.shake, (Math.random() - 0.5) * g.shake);
+  // The battlefield area stays transparent so the 3D scene underneath shows through.
+  ctx.clearRect(0, 0, W, H);
   drawField(ctx, g);
-  ctx.restore();
 
   drawPanel(ctx, g, rc);
+  drawSlotCelebration(ctx, g);
   drawHud(ctx, g, rc);
   drawEffectsOverlay(ctx, g);
   drawDragged(ctx, g, rc);
   drawTooltip(ctx, g);
+  drawActionCard(ctx, g, rc);
   drawPanelTip(ctx, rc);
 
   if (g.phase === 'reward') drawReward(ctx, g, rc);
@@ -117,173 +117,11 @@ export function render(ctx: CanvasRenderingContext2D, g: Game, rc: RenderContext
   drawAudioPanel(ctx, rc);
 }
 
-// ---------- Battlefield ----------
+// ---------- Battlefield overlay (the deck itself is rendered in 3D by scene3d.ts) ----------
 
-const STARS = Array.from({ length: 170 }, () => ({
-  x: FIELD_X + Math.random() * (W - FIELD_X),
-  y: FIELD_TOP + Math.random() * (H - FIELD_TOP),
-  s: Math.random() < 0.12 ? 2 : 1,
-  p: Math.random() * 6,
-}));
-
-function poly(ctx: CanvasRenderingContext2D, pts: Vec[], fill: string, stroke?: string): void {
-  ctx.beginPath();
-  pts.forEach((p, k) => (k ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)));
-  ctx.closePath();
-  ctx.fillStyle = fill;
-  ctx.fill();
-  if (stroke) {
-    ctx.strokeStyle = stroke;
-    ctx.lineWidth = 1;
-    ctx.stroke();
-  }
-}
-
-/** Ground-plane rectangle in world space, as a screen polygon raised by `lift` pixels. */
-function worldRect(x0: number, y0: number, x1: number, y1: number, lift = 0): Vec[] {
-  return [project(x0, y0), project(x1, y0), project(x1, y1), project(x0, y1)].map((p) => ({ x: p.x, y: p.y - lift }));
-}
-
-function drawSpace(ctx: CanvasRenderingContext2D, g: Game): void {
-  const fw = W - FIELD_X;
-  const sky = ctx.createLinearGradient(0, FIELD_TOP, 0, H);
-  sky.addColorStop(0, '#05071a');
-  sky.addColorStop(1, '#0b1026');
-  ctx.fillStyle = sky;
-  ctx.fillRect(FIELD_X, FIELD_TOP, fw, H - FIELD_TOP);
-
-  for (const st of STARS) {
-    const tw = 0.4 + 0.6 * Math.abs(Math.sin(g.time * 0.8 + st.p));
-    ctx.fillStyle = `rgba(220,230,255,${tw})`;
-    const sx = FIELD_X + ((st.x - FIELD_X - g.time * 4 * st.s + fw * 10) % fw);
-    ctx.fillRect(sx, st.y, st.s, st.s);
-  }
-
-  ctx.save();
-  ctx.beginPath();
-  ctx.rect(FIELD_X, FIELD_TOP, fw, H - FIELD_TOP);
-  ctx.clip();
-  const px = 1150;
-  const py = 900;
-  const glow = ctx.createRadialGradient(px, py, 420, px, py, 470);
-  glow.addColorStop(0, 'rgba(110,190,255,0.4)');
-  glow.addColorStop(1, 'rgba(110,190,255,0)');
-  ctx.fillStyle = glow;
-  ctx.beginPath();
-  ctx.arc(px, py, 470, 0, Math.PI * 2);
-  ctx.fill();
-  const planet = ctx.createRadialGradient(px - 120, py - 300, 40, px, py, 430);
-  planet.addColorStop(0, '#3f8fd8');
-  planet.addColorStop(0.6, '#1d4f8f');
-  planet.addColorStop(1, '#0c2347');
-  ctx.fillStyle = planet;
-  ctx.beginPath();
-  ctx.arc(px, py, 425, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.fillStyle = 'rgba(255,255,255,0.1)';
-  for (let k = 0; k < 4; k++) {
-    ctx.beginPath();
-    ctx.ellipse(px - 220 + k * 120, py - 380 + (k % 2) * 30, 60, 7, 0.1, 0, Math.PI * 2);
-    ctx.fill();
-  }
-  ctx.restore();
-}
-
-function drawDeck(ctx: CanvasRenderingContext2D, g: Game): void {
-  const T = 22;
-  // Platform thickness on the two visible sides.
-  const a = project(LX, 0);
-  const b = project(LX, LY);
-  const c = project(0, LY);
-  poly(ctx, [a, b, { x: b.x, y: b.y + T }, { x: a.x, y: a.y + T }], '#141a28');
-  poly(ctx, [b, c, { x: c.x, y: c.y + T }, { x: b.x, y: b.y + T }], '#1b2232');
-  for (let k = 0; k <= 10; k++) {
-    const on = (Math.floor(g.time * 5) + k) % 5 === 0;
-    const p = project(LX, (LY * k) / 10);
-    ctx.fillStyle = on ? '#ff5a74' : '#5a1f2c';
-    ctx.fillRect(p.x - 2, p.y + T / 2 - 1, 4, 3);
-    const q = project((LX * k) / 10, LY);
-    ctx.fillStyle = on ? '#7df4ff' : '#2f6d7a';
-    ctx.fillRect(q.x - 2, q.y + T / 2 - 1, 4, 3);
-  }
-
-  // Deck surface and deployment zone (brighter while placing a unit).
-  poly(ctx, worldRect(0, 0, LX, LY), '#1f2636');
-  const placing = !!g.drag;
-  poly(ctx, worldRect(0, 0, DEPLOY_X, LY), placing ? `rgba(79,140,255,${0.16 + Math.sin(g.time * 6) * 0.04})` : 'rgba(79,140,255,0.08)');
-  // Deck edge highlight, deployment line and spawn edge warning stripe.
-  ctx.strokeStyle = '#46526b';
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  [project(0, 0), project(LX, 0), project(LX, LY), project(0, LY)].forEach((p, k) => (k ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)));
-  ctx.closePath();
-  ctx.stroke();
-  ctx.setLineDash([8, 6]);
-  ctx.strokeStyle = 'rgba(255,224,102,0.45)';
-  const d0 = project(DEPLOY_X, 0);
-  const d1 = project(DEPLOY_X, LY);
-  ctx.beginPath();
-  ctx.moveTo(d0.x, d0.y);
-  ctx.lineTo(d1.x, d1.y);
-  ctx.stroke();
-  ctx.setLineDash([]);
-  poly(ctx, worldRect(LX - 14, 0, LX, LY), 'rgba(255,59,107,0.16)');
-}
-
-function drawMothership(ctx: CanvasRenderingContext2D, g: Game): void {
-  const hpFrac = g.baseHp / g.baseMax;
-  const h = 70;
-  const x0 = -46;
-  const y0 = -24;
-  const y1 = LY + 6;
-  const top = worldRect(x0, y0, 0, y1, h);
-  const fr = [project(0, y0), project(0, y1)];
-  // Face towards the deck (X = 0) and the near end cap (Y = y1).
-  poly(ctx, [fr[0], fr[1], { x: fr[1].x, y: fr[1].y - h }, { x: fr[0].x, y: fr[0].y - h }], '#c4ccd9');
-  const e0 = project(x0, y1);
-  poly(ctx, [e0, fr[1], { x: fr[1].x, y: fr[1].y - h }, { x: e0.x, y: e0.y - h }], '#a3aec0');
-  poly(ctx, top, '#e8edf4');
-  // Stripes along the top.
-  const stripe = (xa: number, xb: number, col: string) => poly(ctx, worldRect(xa, y0, xb, y1, h), col);
-  stripe(-38, -32, '#2f5fe0');
-  stripe(-29, -26, '#dc3540');
-  // Hangar doors facing the deck, one per bay row.
-  for (let r = 0; r < ROWS; r++) {
-    const yc = ((r + 0.5) / ROWS) * LY;
-    const a = project(0, yc - 20);
-    const b = project(0, yc + 20);
-    poly(ctx, [a, b, { x: b.x, y: b.y - 46 }, { x: a.x, y: a.y - 46 }], '#10141e');
-    const lit = 0.5 + 0.5 * Math.sin(g.time * 3 + r);
-    ctx.strokeStyle = `rgba(255,210,63,${0.3 + lit * 0.5})`;
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.moveTo(a.x, a.y - 42);
-    ctx.lineTo(b.x, b.y - 42);
-    ctx.stroke();
-    const l = project(0, yc + 26);
-    ctx.fillStyle = hpFrac > 0.5 ? '#6dffb8' : hpFrac > 0.25 ? '#ffd23f' : Math.sin(g.time * 10) > 0 ? '#ff3b6b' : '#5a1020';
-    ctx.fillRect(l.x - 2, l.y - 56, 4, 4);
-  }
-  // Bridge tower near the far end.
-  const tw = worldRect(-36, 10, -10, 60, h + 34);
-  const tf = [project(-10, 10), project(-10, 60)].map((p) => ({ x: p.x, y: p.y - h }));
-  poly(ctx, [tf[0], tf[1], { x: tf[1].x, y: tf[1].y - 34 }, { x: tf[0].x, y: tf[0].y - 34 }], '#c4ccd9');
-  const te = project(-36, 60);
-  poly(ctx, [{ x: te.x, y: te.y - h }, tf[1], { x: tf[1].x, y: tf[1].y - 34 }, { x: te.x, y: te.y - h - 34 }], '#a3aec0');
-  poly(ctx, tw, '#f4f7fb');
-  const win = [project(-10, 18), project(-10, 52)];
-  ctx.strokeStyle = '#6dffb8';
-  ctx.lineWidth = 3;
-  ctx.beginPath();
-  ctx.moveTo(win[0].x, win[0].y - h - 22);
-  ctx.lineTo(win[1].x, win[1].y - h - 22);
-  ctx.stroke();
-
-  if (hpFrac < 0.5 && Math.random() < (0.5 - hpFrac) * 0.6) {
-    const p = project(-Math.random() * 40, Math.random() * LY);
-    ctx.fillStyle = Math.random() < 0.5 ? '#ff9d2f' : '#ffef5c';
-    ctx.fillRect(p.x, p.y - Math.random() * h, 3, 3);
-  }
+/** Ground-plane rectangle in world space, as a screen polygon. */
+function worldRect(x0: number, y0: number, x1: number, y1: number): Vec[] {
+  return [project(x0, y0), project(x1, y0), project(x1, y1), project(x0, y1)];
 }
 
 function dropTargetStyle(g: Game, i: number): 'merge' | 'swap' | 'blocked' | null {
@@ -325,29 +163,30 @@ function drawUnitMarkers(ctx: CanvasRenderingContext2D, g: Game): void {
         const p = project(m.x, m.y);
         text(ctx, { merge: 'MERGE', swap: 'SWAP', blocked: 'MAX LEVEL' }[style], p.x, p.y + 30, 12, col, 'center');
       }
-    } else if (!g.drag && under && g.canDrag(i)) diamond(ctx, m, 18, 'rgba(255,224,102,0.7)', 2);
+    } else if (!g.drag && g.selected === i) diamond(ctx, m, 20 + Math.sin(g.time * 6) * 1.5, '#ffffff', 2.5, 0.9);
+    else if (!g.drag && under && g.canDrag(i)) diamond(ctx, m, 18, 'rgba(255,224,102,0.7)', 2);
   });
 }
 
 function drawField(ctx: CanvasRenderingContext2D, g: Game): void {
-  drawSpace(ctx, g);
-  drawDeck(ctx, g);
-  drawMothership(ctx, g);
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(FIELD_X, FIELD_TOP, W - FIELD_X, H - FIELD_TOP);
+  ctx.clip();
   drawUnitMarkers(ctx, g);
 
   // Weapon range ring for the hovered unit.
   if (g.hover !== null && !g.drag && !g.dragItem) {
     const m = g.bays[g.hover];
     if (m && !m.wrecked && m.type !== 'artillery') {
-      const w = { x: m.x, y: m.y };
       const r = g.stats(m).range + 14;
-      ctx.strokeStyle = 'rgba(255,224,102,0.35)';
+      ctx.strokeStyle = 'rgba(255,224,102,0.45)';
       ctx.setLineDash([6, 6]);
       ctx.lineWidth = 1.5;
       ctx.beginPath();
       for (let k = 0; k <= 48; k++) {
         const a = (k / 48) * Math.PI * 2;
-        const p = project(w.x + Math.cos(a) * r, w.y + Math.sin(a) * r);
+        const p = project(m.x + Math.cos(a) * r, m.y + Math.sin(a) * r);
         if (k) ctx.lineTo(p.x, p.y);
         else ctx.moveTo(p.x, p.y);
       }
@@ -356,77 +195,26 @@ function drawField(ctx: CanvasRenderingContext2D, g: Game): void {
     }
   }
 
-  // Depth-sorted units: further back (smaller x + y) first.
-  type Item = { depth: number; draw: () => void };
-  const items: Item[] = [];
+  // Status bars and pips above and below each unit.
   g.bays.forEach((m, i) => {
-    if (!m || m.spawn > 0.1) return;
-    items.push({
-      depth: m.x + m.y,
-      draw: () => {
-        const p = project(m.x, m.y);
-        if (g.drag?.from === i) ctx.globalAlpha = 0.3;
-        drawUnit(ctx, g, m, p.x, p.y);
-        ctx.globalAlpha = 1;
-      },
-    });
+    if (!m || m.spawn > 0.1 || m.wrecked || g.drag?.from === i) return;
+    drawUnitStatus(ctx, g, m);
   });
   for (const e of g.enemies) {
-    items.push({
-      depth: e.x + e.y,
-      draw: () => {
-        const p = project(e.x, e.y);
-        drawEnemy(ctx, e.type, p.x, p.y, { t: g.time, flash: e.flash, attack: e.attack, flip: e.flip });
-        if (e.hp < e.maxHp) {
-          const w = e.type === 'titan' ? 80 : 30;
-          bar(ctx, p.x - w / 2, p.y - enemyHeight(e.type) - 4, w, 4, e.hp / e.maxHp, '#ff3b6b');
-        }
-      },
-    });
+    if (e.hp >= e.maxHp) continue;
+    const p = project(e.x, e.y, enemyHeight(e.type) + 6);
+    const w = e.type === 'titan' ? 80 : 30;
+    bar(ctx, p.x - w / 2, p.y - 4, w, 4, e.hp / e.maxHp, '#ff3b6b');
   }
-  items.sort((a, b) => a.depth - b.depth).forEach((it) => it.draw());
 
   ctx.save();
-  ctx.globalCompositeOperation = 'lighter';
-  for (const p of g.projectiles) {
-    const sp = project(p.x, p.y);
-    const y = sp.y - p.z;
-    if (p.kind === 'bullet') {
-      const tp = project(p.tx, p.ty);
-      const ang = Math.atan2(tp.y - p.tz - y, tp.x - sp.x);
-      const pal = p.owner.type === 'bulwark' ? ['rgba(125,244,255,0.5)', '#e3fdff'] : ['rgba(255,90,216,0.55)', '#ffe3f8'];
-      const len = p.owner.type === 'bulwark' ? 10 : 28;
-      ctx.save();
-      ctx.translate(sp.x, y);
-      ctx.rotate(ang);
-      ctx.fillStyle = pal[0];
-      ctx.fillRect(-len, -3, len + 4, 6);
-      ctx.fillStyle = pal[1];
-      ctx.fillRect(-len + 4, -1, len, 2);
-      ctx.restore();
-    } else {
-      ctx.fillStyle = 'rgba(0,0,0,0.3)';
-      ctx.globalCompositeOperation = 'source-over';
-      ctx.beginPath();
-      ctx.ellipse(sp.x, sp.y, 6, 3, 0, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.globalCompositeOperation = 'lighter';
-      ctx.fillStyle = 'rgba(255,157,47,0.5)';
-      ctx.beginPath();
-      ctx.arc(sp.x, y, 8, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.fillStyle = '#fff3c0';
-      ctx.beginPath();
-      ctx.arc(sp.x, y, 3.5, 0, Math.PI * 2);
-      ctx.fill();
-    }
-  }
   for (const p of g.particles) {
     ctx.globalAlpha = Math.max(0, p.life / p.max);
     ctx.globalCompositeOperation = p.color.startsWith('rgba') ? 'source-over' : 'lighter';
     ctx.fillStyle = p.color;
     ctx.fillRect(p.x - p.size / 2, p.y - p.size / 2, p.size, p.size);
   }
+  ctx.restore();
   ctx.restore();
 
   if (g.messageT > 0) {
@@ -439,29 +227,90 @@ function drawField(ctx: CanvasRenderingContext2D, g: Game): void {
   }
 }
 
-function drawUnit(ctx: CanvasRenderingContext2D, g: Game, m: Mech, x: number, y: number, ghost = false): void {
+function drawUnitStatus(ctx: CanvasRenderingContext2D, g: Game, m: Mech): void {
   const tier = tierOf(m.level);
-  drawMech(ctx, m.type, x, y, { t: g.time, tier, recoil: m.recoil, flash: m.flash, wrecked: m.wrecked, thrust: m.moving, shadow: !ghost, flip: m.flip, mk2: m.mk2, mk3: m.mk3 });
-  if (m.wrecked || ghost) return;
   const maxHp = g.stats(m).maxHp;
-  const top = y - MECH_HEIGHT * mechScale(tier) - 4;
-  if (g.phase === 'combat' || m.hp < maxHp) bar(ctx, x - 20, top, 40, 4, m.hp / maxHp, '#6dffb8');
+  const top = project(m.x, m.y, MECH_HEIGHT * mechScale(tier) + 8);
+  if (g.phase === 'combat' || m.hp < maxHp) bar(ctx, top.x - 20, top.y - 4, 40, 4, m.hp / maxHp, '#6dffb8');
+  const foot = project(m.x, m.y);
+  const x = foot.x;
+  const y = foot.y + 8;
   for (let k = 0; k < m.level; k++) {
     ctx.fillStyle = tier === 3 ? '#ffe066' : tier === 2 ? '#e8f1ff' : MECHS[m.type].colors.main;
-    ctx.fillRect(x - 21 + k * 9, y + 8, 6, 3);
+    ctx.fillRect(x - 21 + k * 9, y, 6, 3);
   }
   m.equipment.forEach((id, k) => {
     ctx.fillStyle = equipById(id).color;
-    ctx.fillRect(x - 21 + k * 9, y + 13, 6, 3);
+    ctx.fillRect(x - 21 + k * 9, y + 5, 6, 3);
   });
   if (m.imprint) {
     ctx.fillStyle = '#c77dff';
     ctx.save();
-    ctx.translate(x + 28, y + 9);
+    ctx.translate(x + 28, y + 1);
     ctx.rotate(Math.PI / 4);
     ctx.fillRect(-3, -3, 6, 6);
     ctx.restore();
   }
+}
+
+/** Card next to the selected unit: scrap upgrades (keys 1 to 4) and salvage. */
+function drawActionCard(ctx: CanvasRenderingContext2D, g: Game, rc: RenderContext): void {
+  if (g.selected === null || g.phase !== 'build' || g.drag || g.upgradeChoice()) return;
+  const i = g.selected;
+  const m = g.bays[i];
+  if (!m || m.spawn > 0) return;
+  const d = MECHS[m.type];
+  const pos = project(m.x, m.y);
+  const w = 262;
+  const rowH = 34;
+  const h = 58 + BOOST_IDS.length * rowH + 36;
+  const x = Math.max(FIELD_X + 6, Math.min(W - w - 6, pos.x - w / 2));
+  const y = pos.y + 26 + h > H - 6 ? Math.max(FIELD_TOP + 6, pos.y - MECH_HEIGHT * 2 - h) : pos.y + 26;
+  panel(ctx, x, y, w, h, 'rgba(10,13,20,0.96)', '#ffffff');
+  const v = variantById(m.mk3) ?? variantById(m.mk2);
+  text(ctx, `${v ? `${v.name.toUpperCase()} ` : ''}${d.name.toUpperCase()}`, x + 12, y + 20, 13, d.colors.main);
+  text(ctx, `${className(m.level)} · LV ${m.level}/${MAX_LEVEL}`, x + 12, y + 35, 10, '#e8f1ff');
+  text(ctx, 'SCRAP UPGRADES', x + w - 12, y + 35, 10, '#ffc23d', 'right');
+  text(ctx, 'Merge the same type to level up', x + 12, y + 49, 9, '#8a93a3');
+
+  BOOST_IDS.forEach((id, k) => {
+    const def = boostDef(id, m.type);
+    const rank = m.boosts[id];
+    const ry = y + 58 + k * rowH;
+    text(ctx, `${k + 1}`, x + 14, ry + 21, 10, '#4a5262');
+    text(ctx, def.name, x + 26, ry + 15, 11, def.color);
+    text(ctx, def.desc, x + 26, ry + 28, 9, '#8a93a3');
+    for (let p = 0; p < BOOST_MAX; p++) {
+      ctx.fillStyle = p < rank ? def.color : '#1a1f2b';
+      ctx.fillRect(x + 130 + p * 10, ry + 9, 7, 12);
+    }
+    const maxed = rank >= BOOST_MAX;
+    const cost = g.boostCost(m, id);
+    button(ctx, rc, {
+      x: x + w - 70,
+      y: ry + 4,
+      w: 58,
+      h: 26,
+      label: maxed ? 'MAX' : `+${cost}`,
+      enabled: g.canBoost(i, id),
+      style: 'primary',
+      onClick: () => g.boost(i, id),
+    });
+  });
+
+  button(ctx, rc, {
+    x: x + 10,
+    y: y + h - 32,
+    w: w - 20,
+    h: 24,
+    label: `SALVAGE +${g.salvageValue(m)}`,
+    enabled: g.canDrag(i),
+    style: 'danger',
+    onClick: () => {
+      g.salvage(i);
+      g.selected = null;
+    },
+  });
 }
 
 /** Effects that cross from the panel to the field (launch orbs) and floating text, drawn on top of everything. */
@@ -509,7 +358,7 @@ function drawEffectsOverlay(ctx: CanvasRenderingContext2D, g: Game): void {
         ctx.fill();
       }
     } else if (fx.kind === 'tracer') {
-      ctx.lineWidth = 2;
+      ctx.lineWidth = Math.max(2, fx.r * k);
       ctx.beginPath();
       ctx.moveTo(fx.x, fx.y);
       ctx.lineTo(fx.tx ?? fx.x, fx.ty ?? fx.y);
@@ -551,20 +400,15 @@ function drawDragged(ctx: CanvasRenderingContext2D, g: Game, rc: RenderContext):
   if (!g.drag) return;
   const m = g.bays[g.drag.from];
   if (!m) return;
-  const overUnit = g.hover !== null && g.hover !== g.drag.from;
-  if (overUnit || isOverPanel(rc.mouse)) {
+  // Over the salvage panel the unit is shown as an icon; over the deck, scene3d draws a 3D ghost.
+  if (isOverPanel(rc.mouse)) {
     ctx.globalAlpha = 0.85;
-    drawUnit(ctx, g, m, rc.mouse.x, rc.mouse.y + 30, true);
+    drawMech(ctx, m.type, rc.mouse.x, rc.mouse.y + 30, { t: g.time, tier: tierOf(m.level), recoil: 0, flash: 0, shadow: false, mk2: m.mk2, mk3: m.mk3 });
     ctx.globalAlpha = 1;
     return;
   }
-  // Placement ghost, snapped into the deployment zone.
-  const spot = placementSpot(rc.mouse);
-  const p = project(spot.x, spot.y);
-  diamond(ctx, spot, 18, '#ffe066', 2, 0.9);
-  ctx.globalAlpha = 0.7;
-  drawUnit(ctx, g, m, p.x, p.y, true);
-  ctx.globalAlpha = 1;
+  if (g.hover !== null && g.hover !== g.drag.from) return;
+  diamond(ctx, placementSpot(rc.mouse), 18, '#ffe066', 2, 0.9);
 }
 
 /** Ground point in the deployment zone under the cursor (the cursor holds the unit by its body). */
@@ -573,7 +417,7 @@ export function placementSpot(mouse: { x: number; y: number }): Vec {
 }
 
 function drawTooltip(ctx: CanvasRenderingContext2D, g: Game): void {
-  if (g.drag || g.dragItem || g.hover === null || g.phase === 'reward' || g.upgradeChoice()) return;
+  if (g.drag || g.dragItem || g.hover === null || g.hover === g.selected || g.phase === 'reward' || g.upgradeChoice()) return;
   const m = g.bays[g.hover];
   if (!m || m.spawn > 0) return;
   const pos = project(m.x, m.y);
@@ -583,7 +427,8 @@ function drawTooltip(ctx: CanvasRenderingContext2D, g: Game): void {
   const slots = slotsFor(m.level);
 
   const w = 280;
-  const h = 150 + variants.length * 15 + (st.specials.length ? st.specials.length * 13 : 0) + 22 + (m.equipment.length ? m.equipment.length * 13 + 4 : 0) + (m.imprint ? 30 : 0) + 16;
+  const boosts = BOOST_IDS.filter((id) => m.boosts[id] > 0).map((id) => `${boostDef(id, m.type).name} ${m.boosts[id]}`);
+  const h = 150 + variants.length * 15 + (st.specials.length ? st.specials.length * 13 : 0) + 22 + (m.equipment.length ? m.equipment.length * 13 + 4 : 0) + (boosts.length ? 15 : 0) + (m.imprint ? 30 : 0) + 16;
   const x = pos.x + w + 60 > W ? pos.x - w - 40 : pos.x + 40;
   const y = Math.max(FIELD_TOP + 4, Math.min(H - h - 4, pos.y - 110));
   panel(ctx, x, y, w, h, 'rgba(10,13,20,0.95)', d.colors.main);
@@ -630,12 +475,16 @@ function drawTooltip(ctx: CanvasRenderingContext2D, g: Game): void {
     ly += 13;
   }
   if (m.equipment.length) ly += 4;
+  if (boosts.length) {
+    text(ctx, `UPGRADES: ${boosts.join(' · ')}`, x + 12, ly, 10, '#ffc23d');
+    ly += 15;
+  }
   if (m.imprint) {
     text(ctx, `IMPRINT: ${m.imprint.name}`, x + 12, ly, 11, '#c77dff');
     text(ctx, m.imprint.desc, x + 12, ly + 13, 10, '#8a93a3');
     ly += 30;
   }
-  if (g.canDrag(g.hover)) text(ctx, 'Drag to merge, move or salvage', x + 12, y + h - 6, 9, '#4a5262');
+  if (g.canDrag(g.hover)) text(ctx, 'Click for scrap upgrades · drag to merge or move', x + 12, y + h - 6, 9, '#4a5262');
 }
 
 // ---------- HUD ----------
@@ -807,7 +656,7 @@ function winChanceTip(g: Game, chance: number): TipLine[] {
     { text: `${(chance * 100).toFixed(1)}% of spins have at least one winning line.`, color: '#e8f1ff', gap: 4 },
     { text: 'There are 8 lines: 3 rows, 3 columns and 2 diagonals. A line wins when all 3 symbols match, with Cores counting as any symbol.', color: '#c2cad6', gap: 6 },
     { text: `Expected per spin: ${(unit * 8).toFixed(2)} unit launches, ${(scrap * 8).toFixed(2)} scrap lines`, color: '#e8f1ff', gap: 6 },
-    { text: `Spin cost now: ${g.spinCost} scrap, going up 1 per spin this wave`, color: '#ffc23d' },
+    { text: `Spin cost now: ${g.spinCost} scrap, going up 2 per spin. ${g.spinsLeft()} of ${MAX_SPINS_PER_WAVE} spins left this wave.`, color: '#ffc23d' },
     { text: 'Estimated from 6000 simulated spins with your current odds. Cores that change symbol odds update it.', color: '#4a5262', size: 10, gap: 6 },
   ];
 }
@@ -886,13 +735,29 @@ function drawPanel(ctx: CanvasRenderingContext2D, g: Game, rc: RenderContext): v
     text(ctx, `${g.spawnQueue.length + g.enemies.length} hostiles left`, x + w / 2, y + 56, 13, '#e8f1ff', 'center');
     wrap(ctx, 'Units fight on their own. Enemies that reach the mothership damage it.', x + w / 2, y + 80, w - 30, 11, '#8a93a3', 15, 'center');
   } else {
+    // Glowing invitation when a spin is affordable; squashes when pressed.
+    if (g.canSpin()) {
+      const pulse = 0.35 + Math.sin(g.time * 5) * 0.25;
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.strokeStyle = `rgba(255,194,61,${pulse})`;
+      for (const [grow, width] of [[6, 6], [3, 3]] as const) {
+        ctx.lineWidth = width;
+        ctx.strokeRect(x - grow, y - grow, w + grow * 2, 60 + grow * 2);
+      }
+      ctx.restore();
+    }
+    const press = g.spinPress > 0 ? Math.sin((g.spinPress / 0.15) * Math.PI) * 4 : 0;
     button(ctx, rc, {
-      x,
-      y,
-      w,
-      h: 60,
-      label: g.phase === 'spinning' ? 'SPINNING...' : `SPIN  ${g.spinCost}`,
-      sub: `next spin costs ${g.spinCost + 1}  [Space]`,
+      x: x + press,
+      y: y + press,
+      w: w - press * 2,
+      h: 60 - press * 2,
+      label: g.phase === 'spinning' ? 'SPINNING...' : g.spinsLeft() > 0 ? `SPIN  ${g.spinCost}` : 'NO SPINS LEFT',
+      sub:
+        g.spinsLeft() <= 0
+          ? 'launch the wave to reset'
+          : `${g.spinsLeft()} of ${MAX_SPINS_PER_WAVE} left · next costs ${g.spinCost + 2}  [Space]`,
       enabled: g.canSpin(),
       style: 'primary',
       onClick: () => g.spin(),
@@ -952,6 +817,8 @@ function drawPanel(ctx: CanvasRenderingContext2D, g: Game, rc: RenderContext): v
   const preview = waveSpawns(g.wave, () => 0.5);
   text(ctx, `NEXT: ~${preview.length} hostiles`, x, y, 11, '#e8f1ff');
   if (BOSS_WAVES.includes(g.wave)) text(ctx, 'MOBILE ARMOUR!', x + w, y, 11, '#ff3b6b', 'right');
+  y += 15;
+  text(ctx, `ENEMY HP ×${enemyHpScale(g.wave).toFixed(1)}  DMG ×${enemyDmgScale(g.wave).toFixed(1)}`, x, y, 10, '#ff9a9a');
   const fresh = newThreats(g.wave);
   if (fresh.length) {
     y += 15;
@@ -979,59 +846,287 @@ function drawPanel(ctx: CanvasRenderingContext2D, g: Game, rc: RenderContext): v
   }
 }
 
-function drawReels(ctx: CanvasRenderingContext2D, g: Game): void {
-  const size = SLOT.cell * 3 + SLOT.gap * 2;
-  panel(ctx, SLOT.x - 12, SLOT.y - 30, size + 24, size + 42, '#121722', '#ffc23d');
-  text(ctx, 'REACTOR REELS', SLOT.x, SLOT.y - 10, 13, '#ffc23d');
-  text(ctx, `Spins this wave: ${g.spinsThisWave}`, SLOT.x + size, SLOT.y - 10, 10, '#8a93a3', 'right');
+const REEL_SIZE = SLOT.cell * 3 + SLOT.gap * 2;
+const REELS_CX = SLOT.x + REEL_SIZE / 2;
+const REELS_CY = SLOT.y + REEL_SIZE / 2;
 
+function rainbow(t: number, offset = 0): string {
+  return `hsl(${Math.floor((t * 240 + offset) % 360)}, 100%, 65%)`;
+}
+
+/** Elastic pop from 0 to 1 with an overshoot, for winning symbols and the banner. */
+function elastic(t: number): number {
+  if (t <= 0) return 0;
+  if (t >= 1) return 1;
+  return 1 + Math.pow(2, -10 * t) * Math.sin(((t - 0.075) * 2 * Math.PI) / 0.3);
+}
+
+/** Chasing marquee bulbs around the slot machine frame. */
+function drawMarquee(ctx: CanvasRenderingContext2D, g: Game, x: number, y: number, w: number, h: number): void {
+  const fx = g.winFx;
+  const celebrating = !!fx && fx.tier !== 'none';
+  const suspense = !!g.reel?.anticipation && g.reel.t > g.reel.stops[g.reel.order[1]];
+  const pts: Vec[] = [];
+  const step = 17;
+  for (let px = x; px < x + w; px += step) pts.push({ x: px, y });
+  for (let py = y; py < y + h; py += step) pts.push({ x: x + w, y: py });
+  for (let px = x + w; px > x; px -= step) pts.push({ x: px, y: y + h });
+  for (let py = y + h; py > y; py -= step) pts.push({ x, y: py });
+
+  const speed = celebrating ? 16 : g.reel ? 14 : 5;
+  pts.forEach((p, k) => {
+    let lit: boolean;
+    let color = '#ffd23f';
+    if (celebrating) {
+      lit = (Math.floor(g.time * speed) + k) % 2 === 0;
+      color = fx!.tier === 'jackpot' ? rainbow(g.time, k * 20) : '#ffe066';
+    } else if (suspense) {
+      lit = Math.sin(g.time * 18) > -0.2;
+      color = '#ff9d2f';
+    } else lit = (Math.floor(g.time * speed) + k) % 5 === 0;
+    ctx.fillStyle = lit ? color : '#3a3220';
+    if (lit) {
+      ctx.globalAlpha = 0.3;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 6, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 2.6, 0, Math.PI * 2);
+    ctx.fill();
+  });
+}
+
+function drawRays(ctx: CanvasRenderingContext2D, cx: number, cy: number, radius: number, color: string, t: number, alpha: number): void {
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(t * 1.6);
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = color;
+  for (let k = 0; k < 8; k++) {
+    ctx.rotate(Math.PI / 4);
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.lineTo(radius, -radius * 0.18);
+    ctx.lineTo(radius, radius * 0.18);
+    ctx.closePath();
+    ctx.fill();
+  }
+  ctx.restore();
+  ctx.globalAlpha = 1;
+}
+
+function drawReels(ctx: CanvasRenderingContext2D, g: Game): void {
+  const size = REEL_SIZE;
+  const fx = g.winFx;
+  const celebrating = !!fx && fx.tier !== 'none';
   const reel = g.reel;
+  ctx.save();
+  if (g.panelShake > 0) ctx.translate((Math.random() - 0.5) * g.panelShake, (Math.random() - 0.5) * g.panelShake);
+
+  const border = celebrating ? (fx!.tier === 'jackpot' ? rainbow(g.time) : '#ffe066') : '#ffc23d';
+  panel(ctx, SLOT.x - 12, SLOT.y - 30, size + 24, size + 42, '#121722', border);
+  drawMarquee(ctx, g, SLOT.x - 12, SLOT.y - 30, size + 24, size + 42);
+  text(ctx, 'REACTOR REELS', SLOT.x + 2, SLOT.y - 10, 13, '#ffc23d');
+  // One pip per spin this wave: lit while still available.
+  for (let k = 0; k < MAX_SPINS_PER_WAVE; k++) {
+    const used = k < g.spinsThisWave;
+    ctx.fillStyle = used ? '#3a3220' : '#ffd23f';
+    ctx.fillRect(SLOT.x + size - 2 - (MAX_SPINS_PER_WAVE - k) * 11, SLOT.y - 19, 8, 8);
+  }
+  text(ctx, 'SPINS', SLOT.x + size - 2 - MAX_SPINS_PER_WAVE * 11 - 6, SLOT.y - 11, 9, '#8a93a3', 'right');
+
+  const winners = new Set(celebrating ? fx!.lines.flatMap((l) => l.cells) : []);
+  const suspense = !!reel?.anticipation && reel.t > reel.stops[reel.order[1]] && reel.t < reel.stops[reel.last];
+
   for (let i = 0; i < 9; i++) {
     const r = slotCellRect(i);
     const col = i % 3;
     const row = Math.floor(i / 3);
-    ctx.fillStyle = '#0d111a';
+    const spinning = !!reel && reel.t < reel.stops[col];
+    ctx.fillStyle = suspense && col === reel!.last ? `rgba(255,157,47,${0.18 + Math.sin(g.time * 18) * 0.08})` : '#0d111a';
     ctx.fillRect(r.x, r.y, r.w, r.h);
 
     ctx.save();
     ctx.beginPath();
     ctx.rect(r.x, r.y, r.w, r.h);
     ctx.clip();
-    if (reel && reel.t < reel.stops[col]) {
-      const pos = reel.t * 16;
+    if (spinning) {
+      // Motion blur: the symbol plus fading copies above and below, and speed streaks.
+      // The last reel speeds up during suspense; keep its position continuous when it does.
+      const base0 = reel!.speeds[col];
+      const fast = suspense && col === reel!.last;
+      const split = reel!.stops[reel!.order[1]];
+      const pos = fast ? split * base0 + (reel!.t - split) * 22 : reel!.t * base0;
       const base = Math.floor(pos);
       const frac = pos - base;
-      const strip = reel.strips[col];
+      const strip = reel!.strips[col];
       for (let k = -1; k <= 0; k++) {
         const sym = strip[(base + row - k + strip.length * 4) % strip.length];
-        drawSymbol(ctx, sym, r.x + r.w / 2, r.y + r.h / 2 + (frac + k) * r.h, r.w, g.time);
+        const cy = r.y + r.h / 2 + (frac + k) * r.h;
+        for (const [dy, a] of [[-14, 0.25], [14, 0.25], [0, 0.9]] as const) {
+          ctx.globalAlpha = a;
+          drawSymbol(ctx, sym, r.x + r.w / 2, cy + dy, r.w, g.time);
+        }
+        ctx.globalAlpha = 1;
       }
-      ctx.fillStyle = 'rgba(13,17,26,0.35)';
+      ctx.fillStyle = 'rgba(13,17,26,0.3)';
       ctx.fillRect(r.x, r.y, r.w, r.h);
-    } else {
+      ctx.fillStyle = 'rgba(255,255,255,0.08)';
+      for (let k = 0; k < 4; k++) ctx.fillRect(r.x + 8 + k * 22, r.y, 2, r.h);
+    } else if (!winners.has(i)) {
       const sym = reel ? reel.result[i] : g.lastGrid[i];
       const since = reel ? reel.t - reel.stops[col] : 1;
-      const bounce = since < 0.2 ? Math.sin((since / 0.2) * Math.PI) * 6 : 0;
+      // Slam to a stop: drop past the line, bounce back.
+      const bounce = since < 0.25 ? Math.sin((since / 0.25) * Math.PI) * 9 * (1 - since / 0.25) : 0;
+      const dim = fx?.tier === 'none' ? 0.35 + 0.65 * Math.min(1, fx.t / 0.6) : celebrating ? 0.45 : 1;
+      ctx.globalAlpha = dim;
       drawSymbol(ctx, sym, r.x + r.w / 2, r.y + r.h / 2 + bounce, r.w, g.time);
+      ctx.globalAlpha = 1;
+      if (since < 0.2) {
+        ctx.fillStyle = `rgba(255,255,255,${0.5 * (1 - since / 0.2)})`;
+        ctx.fillRect(r.x, r.y, r.w, r.h);
+      }
     }
     ctx.restore();
   }
 
-  if (g.lineFlash) {
-    ctx.globalAlpha = Math.min(1, g.lineFlash.t);
-    ctx.lineWidth = 6;
+  if (suspense) {
+    const a = slotCellRect(reel!.last);
+    const b = slotCellRect(6 + reel!.last);
+    ctx.strokeStyle = `rgba(255,190,60,${0.6 + Math.sin(g.time * 18) * 0.35})`;
+    ctx.lineWidth = 4;
+    ctx.strokeRect(a.x - 3, a.y - 3, a.w + 6, b.y + b.h - a.y + 6);
+    text(ctx, '!', a.x + a.w / 2, a.y - 14 + Math.sin(g.time * 20) * 2, 16, '#ffbe3c', 'center');
+  }
+
+  // Winning symbols pop out over everything, with spinning rays behind them.
+  if (celebrating) {
+    const t = fx!.t;
+    for (const i of winners) {
+      const r = slotCellRect(i);
+      const sym = g.lastGrid[i];
+      const cx = r.x + r.w / 2;
+      const cy = r.y + r.h / 2;
+      const delay = (i % 3) * 0.06;
+      const pop = elastic(Math.min(1, Math.max(0, (t - delay) / 0.5)));
+      const pulse = 1 + Math.sin(t * 10) * 0.04;
+      const color = SYMBOL_COLORS[sym];
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      drawRays(ctx, cx, cy, 58 * pop, color, g.time + i, 0.35);
+      const glow = ctx.createRadialGradient(cx, cy, 4, cx, cy, 52);
+      glow.addColorStop(0, 'rgba(255,255,255,0.5)');
+      glow.addColorStop(1, 'rgba(255,255,255,0)');
+      ctx.fillStyle = glow;
+      ctx.beginPath();
+      ctx.arc(cx, cy, 52 * pop, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+      ctx.fillStyle = '#1e2638';
+      ctx.fillRect(r.x, r.y, r.w, r.h);
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 3;
+      ctx.strokeRect(r.x + 1.5, r.y + 1.5, r.w - 3, r.h - 3);
+      drawSymbol(ctx, sym, cx, cy, r.w * (0.8 + 0.35 * pop) * pulse, g.time);
+    }
+
+    // Winning lines sweep across, trailing sparkles.
+    ctx.save();
     ctx.lineCap = 'round';
-    for (const line of g.lineFlash.lines) {
+    fx!.lines.forEach((line, n) => {
       const a = slotCellRect(line.cells[0]);
       const b = slotCellRect(line.cells[2]);
+      const ax = a.x + a.w / 2;
+      const ay = a.y + a.h / 2;
+      const k = Math.min(1, Math.max(0, (t - 0.15 - n * 0.12) / 0.3));
+      if (k <= 0) return;
+      const ex = ax + (b.x + b.w / 2 - ax) * k;
+      const ey = ay + (b.y + b.h / 2 - ay) * k;
+      const fade = Math.min(1, (2.6 - t) / 0.5);
+      ctx.globalAlpha = fade;
+      ctx.globalCompositeOperation = 'lighter';
       ctx.strokeStyle = SYMBOL_COLORS[line.symbol];
+      ctx.lineWidth = 14;
+      ctx.globalAlpha = 0.35 * fade;
       ctx.beginPath();
-      ctx.moveTo(a.x + a.w / 2, a.y + a.h / 2);
-      ctx.lineTo(b.x + b.w / 2, b.y + b.h / 2);
+      ctx.moveTo(ax, ay);
+      ctx.lineTo(ex, ey);
       ctx.stroke();
-    }
-    ctx.globalAlpha = 1;
+      ctx.globalAlpha = fade;
+      ctx.lineWidth = 5;
+      ctx.stroke();
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      if (k < 1) {
+        ctx.fillStyle = '#ffffff';
+        ctx.beginPath();
+        ctx.arc(ex, ey, 7, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    });
+    ctx.restore();
   }
+
+  if (g.panelFlash > 0) {
+    ctx.fillStyle = `rgba(255,255,255,${g.panelFlash * 0.7})`;
+    ctx.fillRect(SLOT.x - 12, SLOT.y - 30, size + 24, size + 42);
+  }
+  ctx.restore();
+}
+
+/** Big punchy win banner over the reels, plus the confetti. Drawn above the rest of the UI. */
+function drawSlotCelebration(ctx: CanvasRenderingContext2D, g: Game): void {
+  const fx = g.winFx;
+  // Let the winning symbols pop and the line sweep first, then punch in the banner.
+  const delay = fx && fx.tier !== 'none' ? 0.6 : 0;
+  if (fx && fx.t >= delay) {
+    const t = fx.t - delay;
+    const none = fx.tier === 'none';
+    const life = none ? 0.8 : 2.6 - delay;
+    const scale = none ? 1 : elastic(Math.min(1, t / 0.45)) * (fx.tier === 'jackpot' ? 1.25 : fx.tier === 'big' ? 1.1 : 1);
+    const alpha = Math.min(1, (life - t) / 0.35);
+    ctx.save();
+    ctx.globalAlpha = Math.max(0, alpha);
+    ctx.translate(REELS_CX, none ? REELS_CY : REELS_CY - 6);
+    ctx.rotate(none ? 0 : Math.sin(t * 7) * 0.04);
+    ctx.scale(scale, scale);
+    if (none) {
+      ctx.fillStyle = 'rgba(10,13,20,0.75)';
+      ctx.fillRect(-80, -18, 160, 32);
+      text(ctx, 'NO MATCH', 0, 6, 16, '#8a93a3', 'center');
+    } else {
+      const big = fx.tier === 'jackpot' ? 40 : fx.tier === 'big' ? 34 : 30;
+      ctx.fillStyle = 'rgba(10,13,20,0.82)';
+      ctx.fillRect(-128, -big, 256, big + 34);
+      ctx.strokeStyle = fx.tier === 'jackpot' ? rainbow(g.time) : '#ffe066';
+      ctx.lineWidth = 3;
+      ctx.strokeRect(-128, -big, 256, big + 34);
+      ctx.font = `bold ${big}px ${FONT}`;
+      ctx.textAlign = 'center';
+      ctx.lineWidth = 6;
+      ctx.strokeStyle = '#05070b';
+      ctx.strokeText(fx.label, 0, 8);
+      const fill = fx.tier === 'jackpot' ? rainbow(g.time, 0) : fx.tier === 'scrap' ? '#d6dde8' : '#ffe066';
+      ctx.fillStyle = fill;
+      ctx.fillText(fx.label, 0, 8);
+      if (fx.sub) text(ctx, fx.sub, 0, 26, 12, '#e8f1ff', 'center');
+    }
+    ctx.restore();
+  }
+
+  for (const p of g.uiParticles) {
+    ctx.globalAlpha = Math.min(1, p.life / p.max * 2);
+    ctx.fillStyle = p.color;
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    ctx.rotate(p.life * 9);
+    ctx.fillRect(-p.size / 2, -p.size / 4, p.size, p.size / 2);
+    ctx.restore();
+  }
+  ctx.globalAlpha = 1;
 }
 
 // ---------- Overlays ----------

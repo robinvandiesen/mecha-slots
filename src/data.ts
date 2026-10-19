@@ -44,11 +44,11 @@ export const MECHS: Record<MechType, MechDef> = {
   lancer: {
     name: 'Lancer',
     role: 'Beam sabre bruiser, best at the front',
-    hp: 75,
-    dmg: 20,
-    cooldown: 0.8,
+    hp: 110,
+    dmg: 30,
+    cooldown: 0.65,
     range: 10,
-    speed: 64,
+    speed: 72,
     splash: 0,
     regen: 0,
     attack: 'melee',
@@ -121,6 +121,8 @@ export interface EnemyDef {
   explode?: number;
   /** Heals nearby enemies by this much HP per second instead of attacking. */
   heal?: number;
+  /** A second, long-range attack (the boss's cannon). Its shots explode, hurting mechs nearby. */
+  ranged?: { range: number; dmg: number; cooldown: number; splash: number };
   /** One-line description for the enemy guide. */
   blurb: string;
 }
@@ -129,7 +131,7 @@ export const ENEMIES: Record<EnemyType, EnemyDef> = {
   drone: { name: 'Scout Pod', hp: 14, speed: 60, dmg: 4, cooldown: 0.8, reward: 1, baseDamage: 1, radius: 10, range: 70, aggro: 140, blurb: 'Fast, fragile, shoots from short range' },
   crawler: { name: 'Grunt', hp: 32, speed: 34, dmg: 7, cooldown: 1, reward: 1, baseDamage: 2, radius: 12, range: 100, aggro: 150, blurb: 'Standard mono-eye trooper with a machine gun' },
   brute: { name: 'Heavy', hp: 120, speed: 20, dmg: 16, cooldown: 1.4, reward: 3, baseDamage: 4, radius: 16, range: 6, aggro: 130, blurb: 'Slow brawler with a heat sword' },
-  titan: { name: 'Mobile Armour', hp: 600, speed: 11, dmg: 35, cooldown: 1.6, reward: 20, baseDamage: 10, radius: 30, range: 20, aggro: 180, blurb: 'Boss. Drops equipment when destroyed' },
+  titan: { name: 'Mobile Armour', hp: 400, speed: 20, dmg: 25, cooldown: 1.6, reward: 20, baseDamage: 10, radius: 30, range: 20, aggro: 320, ranged: { range: 300, dmg: 13, cooldown: 3, splash: 35 }, blurb: 'Boss. Cannon at range, crushing claws up close. Drops equipment when destroyed' },
   bomber: { name: 'Bomb Pod', hp: 18, speed: 75, dmg: 30, cooldown: 1, reward: 1, baseDamage: 4, radius: 10, range: 2, aggro: 200, explode: 55, blurb: 'Rushes the nearest mech and explodes' },
   jet: { name: 'Fighter Jet', hp: 26, speed: 105, dmg: 0, cooldown: 1, reward: 2, baseDamage: 4, radius: 12, range: 0, aggro: 0, flying: true, blurb: 'Flies straight at the mothership. Only Gunners and Bulwarks can hit it' },
   sniper: { name: 'Sniper', hp: 38, speed: 26, dmg: 20, cooldown: 2.6, reward: 2, baseDamage: 2, radius: 12, range: 260, aggro: 290, blurb: 'Hangs back and fires long-range beam shots' },
@@ -292,8 +294,36 @@ export interface Spawn {
   at: number;
 }
 
+// Difficulty curve: every wave is tougher than the last in HP, damage and size.
+// Kept in one object so the dev balance tool can tune it live (see sim.ts).
+export const DIFFICULTY = {
+  /** HP multiplier per wave: 1 + linear * (wave - 1) + curve * (wave - 1)^2. */
+  hpLinear: 0.72,
+  hpCurve: 0.115,
+  /** Damage multiplier against mechs: 1 + linear * (wave - 1) + curve * (wave - 1)^2. */
+  dmgPerWave: 0.28,
+  dmgCurve: 0.032,
+  /** Damage to the mothership grows by this much per wave. */
+  baseDmgPerWave: 0.15,
+  /** Enemies per wave: 5 + sizePerWave * wave. */
+  sizePerWave: 3.4,
+};
+
 export function enemyHpScale(wave: number): number {
-  return 1 + 0.42 * (wave - 1) + 0.03 * (wave - 1) ** 2;
+  return 1 + DIFFICULTY.hpLinear * (wave - 1) + DIFFICULTY.hpCurve * (wave - 1) ** 2;
+}
+
+export function enemyDmgScale(wave: number): number {
+  return 1 + DIFFICULTY.dmgPerWave * (wave - 1) + DIFFICULTY.dmgCurve * (wave - 1) ** 2;
+}
+
+/** Damage an enemy deals when it reaches the mothership (whole points, at least its base value). */
+export function baseDamageFor(base: number, wave: number): number {
+  return Math.max(base, Math.round(base * (1 + DIFFICULTY.baseDmgPerWave * (wave - 1))));
+}
+
+export function waveSize(wave: number): number {
+  return 5 + Math.round(wave * DIFFICULTY.sizePerWave);
 }
 
 /** Spawn weights per enemy type and the first wave each one can appear in. */
@@ -317,7 +347,7 @@ export function waveRoster(wave: number): EnemyType[] {
 
 export function waveSpawns(wave: number, rng: () => number = Math.random): Spawn[] {
   const spawns: Spawn[] = [];
-  const count = 5 + wave * 2;
+  const count = waveSize(wave);
   const interval = Math.max(0.35, 1.1 - wave * 0.07);
   const table = WAVE_TABLE.filter((e) => wave >= e.from);
   const total = table.reduce((sum, e) => sum + e.weight(wave), 0);

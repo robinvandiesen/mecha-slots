@@ -17,15 +17,27 @@
         align-items: center;
         justify-content: center;
       }
+      #stage {
+        position: relative;
+      }
       canvas {
+        position: absolute;
         display: block;
-        image-rendering: pixelated;
         touch-action: none;
+      }
+      #game {
+        left: 0;
+        top: 0;
+        image-rendering: pixelated;
       }
     </style>
   </head>
   <body>
-    <canvas id="game"></canvas>
+    <div id="stage">
+      <!-- The 3D battlefield sits underneath the 2D canvas, which draws the UI. -->
+      <canvas id="world"></canvas>
+      <canvas id="game"></canvas>
+    </div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>
